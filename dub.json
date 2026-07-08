@@ -12,9 +12,13 @@
 				"fluent-asserts": "*",
 				"unit-threaded": "*"
 			},
+			"mainSourceFile": "bin/ut.d",
 			"name": "unittest",
+			"preBuildCommands": [
+				"$DUB run --compiler=$$DC unit-threaded -c gen_ut_main -- -f bin/ut.d -d $DUB"
+			],
 			"targetName": "raft_tests",
-			"targetType": "library"
+			"targetType": "executable"
 		}
 	],
 	"copyright": "Copyright © 2026, Marcelo Aires Caetano",

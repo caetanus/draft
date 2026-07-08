@@ -21,8 +21,17 @@ ecosystem, so this one is being built from scratch — primarily for
 
 ## Status
 
-Skeleton: types and interfaces are laid out (`raft.types`, `raft.storage`,
-`raft.transport`, `raft.node`); the algorithm itself is not implemented yet.
+The consensus core is implemented and tested: elections (randomized,
+seeded), log replication with conflict truncation, commit advancement with
+the paper's own-term rule (automatic no-op on election, §5.4.2).
+`raft.sim` ships a deterministic cluster simulator — in-memory storage and
+transport, manual clock, explicit partitions/crashes/restarts and seeded
+message loss — that asserts Election Safety, Log Matching and State Machine
+Safety after every tick. Seven scenario suites run in ~10ms.
+
+Not yet implemented: membership changes, snapshot transfer (InstallSnapshot),
+ReadIndex, and the production `VibeTransport`/durable storage (those live on
+the host side — dreads).
 
 ## Vendoring
 
