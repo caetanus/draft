@@ -64,12 +64,32 @@ struct AppendEntriesReply
 //   4. applies the newly committed entries
 // This is what makes async durability correct.
 
+// InstallSnapshot (§7): when the leader has compacted the log past the entries
+// a follower still needs, it ships a state-machine snapshot instead. One
+// message here (real Raft chunks large snapshots — noted as a scaling step).
+struct InstallSnapshot
+{
+    Term term;
+    NodeId leaderId;
+    Index lastIncludedIndex;
+    Term lastIncludedTerm;
+    const(ubyte)[] data; // opaque state-machine snapshot (host-defined)
+}
+
+struct InstallSnapshotReply
+{
+    Term term;
+    Index lastIncludedIndex; // echoed so the leader advances matchIndex/nextIndex
+}
+
 enum MessageType : ubyte
 {
     requestVote,
     requestVoteReply,
     appendEntries,
-    appendEntriesReply
+    appendEntriesReply,
+    installSnapshot,
+    installSnapshotReply
 }
 
 struct RaftMessage
@@ -80,12 +100,23 @@ struct RaftMessage
     RequestVoteReply rvr;
     AppendEntries ae;
     AppendEntriesReply aer;
+    InstallSnapshot is_;
+    InstallSnapshotReply isr;
+}
+
+/// Host must load this into the state machine (replacing current state).
+struct SnapshotToApply
+{
+    Index lastIncludedIndex;
+    Term lastIncludedTerm;
+    const(ubyte)[] data;
 }
 
 struct Ready
 {
     RaftMessage[] messages; // send only after persistUpto is durable
     Index persistUpto; // log is written up to here; host must make it durable
+    SnapshotToApply* applySnapshot; // non-null: install this snapshot first
 }
 
 // --- membership changes (joint consensus, §6) ---

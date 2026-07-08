@@ -12,7 +12,9 @@ enum MsgKind : ubyte
     requestVote = 1,
     requestVoteReply = 2,
     appendEntries = 3,
-    appendEntriesReply = 4
+    appendEntriesReply = 4,
+    installSnapshot = 5,
+    installSnapshotReply = 6
 }
 
 // --- little-endian primitives ---
@@ -150,6 +152,50 @@ ubyte[] encodeAppendEntriesReply(NodeId sender, const ref AppendEntriesReply m) 
         putU8(o, m.success ? 1 : 0);
         putU64(o, m.matchIndex);
     });
+}
+
+ubyte[] encodeInstallSnapshot(NodeId sender, const ref InstallSnapshot m) nothrow
+{
+    return frame(sender, MsgKind.installSnapshot, (ref o) {
+        putU64(o, m.term);
+        putU32(o, m.leaderId);
+        putU64(o, m.lastIncludedIndex);
+        putU64(o, m.lastIncludedTerm);
+        putU32(o, cast(uint) m.data.length);
+        o ~= m.data;
+    });
+}
+
+ubyte[] encodeInstallSnapshotReply(NodeId sender, const ref InstallSnapshotReply m) nothrow
+{
+    return frame(sender, MsgKind.installSnapshotReply, (ref o) {
+        putU64(o, m.term);
+        putU64(o, m.lastIncludedIndex);
+    });
+}
+
+bool decodeInstallSnapshot(scope const(ubyte)[] body_, out InstallSnapshot m) nothrow
+{
+    auto r = Reader(body_);
+    r.u8();
+    m.term = r.u64();
+    m.leaderId = r.u32();
+    m.lastIncludedIndex = r.u64();
+    m.lastIncludedTerm = r.u64();
+    auto len = r.u32();
+    if (!r.ok)
+        return false;
+    m.data = r.bytes(len).dup;
+    return r.ok;
+}
+
+bool decodeInstallSnapshotReply(scope const(ubyte)[] body_, out InstallSnapshotReply m) nothrow
+{
+    auto r = Reader(body_);
+    r.u8();
+    m.term = r.u64();
+    m.lastIncludedIndex = r.u64();
+    return r.ok;
 }
 
 /// Reads the sender id from a frame body ([u32 sender][kind][fields]) and

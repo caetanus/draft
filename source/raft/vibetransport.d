@@ -63,6 +63,23 @@ final class VibeTransport
         onMessage = h;
     }
 
+    /// Adds a peer to a running transport (a node joining via membership
+    /// change). Idempotent; starts its connect/write loops if we're up.
+    void addPeer(PeerAddress p)
+    {
+        if (p.id in peerState)
+            return;
+        auto st = new Peer;
+        st.addr = p;
+        st.hasData = createManualEvent();
+        peerState[p.id] = st;
+        if (running)
+        {
+            runTask(() nothrow { connectLoop(st); });
+            runTask(() nothrow { writeLoop(st); });
+        }
+    }
+
     void start(ushort listenPort)
     {
         running = true;
@@ -97,6 +114,12 @@ final class VibeTransport
             break;
         case MessageType.appendEntriesReply:
             framed = encodeAppendEntriesReply(self, m.aer);
+            break;
+        case MessageType.installSnapshot:
+            framed = encodeInstallSnapshot(self, m.is_);
+            break;
+        case MessageType.installSnapshotReply:
+            framed = encodeInstallSnapshotReply(self, m.isr);
             break;
         }
         enqueue(m.to, framed);

@@ -15,7 +15,10 @@ final class MemoryStorage : Storage
 {
     private Term term_;
     private NodeId voted_;
-    private LogEntry[] log_;
+    private LogEntry[] log_; // entries with index > snapIdx_
+    private Index snapIdx_; // lastIncludedIndex of the snapshot (0 = none)
+    private Term snapTerm_;
+    private const(ubyte)[] snapData_;
 
 nothrow:
     Term currentTerm()
@@ -40,22 +43,27 @@ nothrow:
 
     Index lastIndex()
     {
-        return log_.length;
+        return snapIdx_ + log_.length;
     }
 
     Term termAt(Index i)
     {
-        return i >= 1 && i <= log_.length ? log_[cast(size_t) i - 1].term : 0;
+        if (i == snapIdx_)
+            return snapTerm_;
+        if (i > snapIdx_ && i <= lastIndex)
+            return log_[cast(size_t)(i - snapIdx_ - 1)].term;
+        return 0;
     }
 
     const(LogEntry)[] entriesFrom(Index from, size_t max)
     {
-        if (from < 1 || from > log_.length)
+        if (from <= snapIdx_ || from > lastIndex)
             return null;
-        auto end = cast(size_t)(from - 1) + max;
+        auto start = cast(size_t)(from - snapIdx_ - 1);
+        auto end = start + max;
         if (end > log_.length)
             end = log_.length;
-        return log_[cast(size_t) from - 1 .. end];
+        return log_[start .. end];
     }
 
     void append(scope const(LogEntry)[] entries)
@@ -66,8 +74,37 @@ nothrow:
 
     void truncateFrom(Index from)
     {
-        if (from >= 1 && from <= log_.length)
-            log_ = log_[0 .. cast(size_t) from - 1];
+        if (from > snapIdx_ && from <= lastIndex)
+            log_ = log_[0 .. cast(size_t)(from - snapIdx_ - 1)];
+    }
+
+    Index snapshotIndex()
+    {
+        return snapIdx_;
+    }
+
+    Term snapshotTerm()
+    {
+        return snapTerm_;
+    }
+
+    const(ubyte)[] snapshotData()
+    {
+        return snapData_;
+    }
+
+    void saveSnapshot(Index lastIncludedIndex, Term lastIncludedTerm, scope const(ubyte)[] data)
+    {
+        if (lastIncludedIndex <= snapIdx_)
+            return;
+        // keep only entries strictly after the snapshot
+        if (lastIncludedIndex >= lastIndex)
+            log_ = null;
+        else
+            log_ = log_[cast(size_t)(lastIncludedIndex - snapIdx_) .. $];
+        snapIdx_ = lastIncludedIndex;
+        snapTerm_ = lastIncludedTerm;
+        snapData_ = data.dup;
     }
 }
 
@@ -216,6 +253,16 @@ final class Cluster
             if (!alive[i])
                 continue;
             auto rd = nodes[i].takeReady();
+            // a leader's snapshot arrived: load it into this node's "state
+            // machine" — the snapshot encodes the applied-entry count it covers
+            if (rd.applySnapshot !is null)
+            {
+                auto data = rd.applySnapshot.data;
+                size_t count = 0;
+                foreach (b; 0 .. (data.length < 8 ? data.length : 8))
+                    count |= cast(size_t) data[b] << (8 * b);
+                appliedPositions[i] = count; // fast-forward past the snapshot
+            }
             // memory storage is already durable; production RaftLog fsyncs here
             nodes[i].onPersisted(rd.persistUpto);
             foreach (ref m; rd.messages)
@@ -250,13 +297,19 @@ final class Cluster
             case MessageType.appendEntriesReply:
                 nodes[t].onAppendEntriesReply(env.from, env.msg.aer);
                 break;
+            case MessageType.installSnapshot:
+                nodes[t].onInstallSnapshot(env.from, env.msg.is_);
+                break;
+            case MessageType.installSnapshotReply:
+                nodes[t].onInstallSnapshotReply(env.from, env.msg.isr);
+                break;
             }
         }
     }
 
     private void route(NodeId from, ref RaftMessage m) nothrow
     {
-        // deep-copy AppendEntries payloads: the "wire" must not alias storage
+        // deep-copy payloads: the "wire" must not alias mutable storage
         if (m.type == MessageType.appendEntries)
         {
             auto copy = new LogEntry[m.ae.entries.length];
@@ -264,7 +317,24 @@ final class Cluster
                 copy[k] = LogEntry(e.term, e.index, e.payload.dup);
             m.ae.entries = copy;
         }
+        else if (m.type == MessageType.installSnapshot)
+            m.is_.data = m.is_.data.dup;
         queue ~= Envelope(from, m);
+    }
+
+    /// Compacts the leader's log up to its commit index, replacing it with a
+    /// snapshot (encoded here as the count of applied entries it covers).
+    void compactLeader() nothrow
+    {
+        auto l = leader();
+        if (l == 0)
+            return;
+        auto upto = nodes[l - 1].commitIndex;
+        auto count = appliedPositions[l - 1];
+        ubyte[8] data;
+        foreach (b; 0 .. 8)
+            data[b] = cast(ubyte)(count >> (8 * b));
+        nodes[l - 1].compact(upto, data[]);
     }
 
     NodeId leader() nothrow
@@ -330,22 +400,27 @@ final class Cluster
             else
                 leaderOfTerm[t] = cast(NodeId)(i + 1);
         }
-        // Log Matching: same (index, term) => same prefix
+        // Log Matching: same (index, term) => same payload. Compared over the
+        // index range both nodes still retain (compaction discards prefixes,
+        // so absolute indices — not slice positions — are what matter).
         foreach (a; 0 .. n)
             foreach (b; a + 1 .. n)
             {
-                auto la = storages[a].entriesFrom(1, size_t.max);
-                auto lb = storages[b].entriesFrom(1, size_t.max);
-                auto common = la.length < lb.length ? la.length : lb.length;
-                foreach_reverse (k; 0 .. common)
+                auto lo = storages[a].snapshotIndex;
+                if (storages[b].snapshotIndex > lo)
+                    lo = storages[b].snapshotIndex;
+                lo += 1;
+                auto hi = storages[a].lastIndex;
+                if (storages[b].lastIndex < hi)
+                    hi = storages[b].lastIndex;
+                for (auto i = lo; i <= hi; i++)
                 {
-                    if (la[k].term == lb[k].term)
-                    {
-                        foreach (j; 0 .. k + 1)
-                            assert(la[j].term == lb[j].term && la[j].payload == lb[j].payload,
-                                    "log matching violated");
-                        break;
-                    }
+                    if (storages[a].termAt(i) != storages[b].termAt(i))
+                        continue;
+                    auto ea = storages[a].entriesFrom(i, 1);
+                    auto eb = storages[b].entriesFrom(i, 1);
+                    if (ea.length && eb.length)
+                        assert(ea[0].payload == eb[0].payload, "log matching violated");
                 }
             }
         foreach (i; 0 .. n)

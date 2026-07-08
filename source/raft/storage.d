@@ -18,10 +18,19 @@ nothrow:
 
     // --- log ---
     Index lastIndex();
-    Term termAt(Index i);
-    /// Entries [from .. min(from+max, lastIndex)]; slices valid until the next mutation.
+    Term termAt(Index i); // valid for i >= snapshotIndex; == snapshotTerm at the boundary
+    /// Entries [from .. min(from+max, lastIndex)]; from must be > snapshotIndex.
     const(LogEntry)[] entriesFrom(Index from, size_t max);
     void append(scope const(LogEntry)[] entries);
     /// Drops every entry with index >= from (conflict resolution).
     void truncateFrom(Index from);
+
+    // --- snapshot / log compaction (§7) ---
+    Index snapshotIndex(); // lastIncludedIndex of the stored snapshot (0 = none)
+    Term snapshotTerm();
+    const(ubyte)[] snapshotData();
+    /// Stores a snapshot covering the log up to (index, term) and discards
+    /// every entry with index <= that. If the snapshot is ahead of the whole
+    /// log, the log is emptied.
+    void saveSnapshot(Index lastIncludedIndex, Term lastIncludedTerm, scope const(ubyte)[] data);
 }

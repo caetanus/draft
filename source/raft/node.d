@@ -21,6 +21,8 @@ struct Config
     uint electionTimeoutTicks = 10;
     uint heartbeatTicks = 2;
     ulong seed = 1;
+    bool joinMode; // start as a passive learner: bootstrap config excludes
+    // self so this node never self-elects until a committed config adds it
 }
 
 enum NOOP_PAYLOAD = cast(const(ubyte)[]) "\0raft-noop";
@@ -41,6 +43,7 @@ struct RaftNode
     private Index[NodeId] matchIndex;
     private bool[NodeId] voteFrom;
     private RaftMessage[] outbox;
+    private SnapshotToApply* pendingSnapshot; // set when a leader's snapshot must be loaded
 
     // membership
     private Configuration activeConfig;
@@ -59,9 +62,12 @@ struct RaftNode
         this.heartbeatTicks = cfg.heartbeatTicks;
         this.storage = storage;
         this.rng = cfg.seed | 1;
-        bootstrapConfig.cNew = cfg.self ~ cfg.peers;
+        bootstrapConfig.cNew = cfg.joinMode ? cfg.peers.dup : cfg.self ~ cfg.peers;
         activeConfig = bootstrapConfig;
         persistedIndex_ = storage.lastIndex;
+        // a stored snapshot is committed and applied state
+        commitIndex_ = storage.snapshotIndex;
+        lastApplied = storage.snapshotIndex;
         refreshConfigFromLog(); // recover the latest config entry, if any
         resetElectionDeadline();
     }
@@ -95,8 +101,20 @@ struct RaftNode
         Ready rd;
         rd.messages = outbox;
         rd.persistUpto = storage.lastIndex;
+        rd.applySnapshot = pendingSnapshot;
         outbox = null;
+        pendingSnapshot = null;
         return rd;
+    }
+
+    /// Host-driven log compaction: replaces the log up to `upto` (which must be
+    /// applied) with `snapshotData`, a state-machine snapshot. Discards the
+    /// covered entries so replay/join no longer carries dead history.
+    void compact(Index upto, scope const(ubyte)[] snapshotData) nothrow
+    {
+        if (upto == 0 || upto > lastApplied || upto <= storage.snapshotIndex)
+            return;
+        storage.saveSnapshot(upto, storage.termAt(upto), snapshotData);
     }
 
     void onPersisted(Index index) nothrow
@@ -460,10 +478,63 @@ struct RaftNode
     {
         enum MAX_BATCH = 64;
         auto ni = idxGet(nextIndex, to, storage.lastIndex + 1);
+        // the entries this follower needs were compacted away -> ship a snapshot
+        if (ni <= storage.snapshotIndex)
+        {
+            emitIs(to, InstallSnapshot(storage.currentTerm, self, storage.snapshotIndex,
+                    storage.snapshotTerm, storage.snapshotData));
+            return;
+        }
         auto prev = ni - 1;
         auto rpc = AppendEntries(storage.currentTerm, self, prev,
                 prev > 0 ? storage.termAt(prev) : 0, commitIndex_, storage.entriesFrom(ni, MAX_BATCH));
         emitAe(to, rpc);
+    }
+
+    void onInstallSnapshot(NodeId from, const ref InstallSnapshot rpc) nothrow
+    {
+        if (rpc.term < storage.currentTerm)
+        {
+            emitIsr(from, InstallSnapshotReply(storage.currentTerm, 0));
+            return;
+        }
+        if (rpc.term > storage.currentTerm)
+            stepDown(rpc.term);
+        role_ = Role.follower;
+        leaderId_ = rpc.leaderId;
+        sinceHeard = 0;
+        resetElectionDeadline();
+        // ignore a stale snapshot we already cover
+        if (rpc.lastIncludedIndex > storage.snapshotIndex && rpc.lastIncludedIndex > commitIndex_)
+        {
+            storage.saveSnapshot(rpc.lastIncludedIndex, rpc.lastIncludedTerm, rpc.data);
+            if (persistedIndex_ < rpc.lastIncludedIndex)
+                persistedIndex_ = rpc.lastIncludedIndex;
+            commitIndex_ = rpc.lastIncludedIndex;
+            lastApplied = rpc.lastIncludedIndex;
+            refreshConfigFromLog();
+            // hand the snapshot to the host to load into the state machine
+            pendingSnapshot = new SnapshotToApply(rpc.lastIncludedIndex,
+                    rpc.lastIncludedTerm, rpc.data.dup);
+        }
+        emitIsr(from, InstallSnapshotReply(storage.currentTerm, storage.snapshotIndex));
+    }
+
+    void onInstallSnapshotReply(NodeId from, const ref InstallSnapshotReply rpc) nothrow
+    {
+        if (rpc.term > storage.currentTerm)
+        {
+            stepDown(rpc.term);
+            return;
+        }
+        if (role_ != Role.leader || rpc.term != storage.currentTerm || rpc.lastIncludedIndex == 0)
+            return;
+        if (rpc.lastIncludedIndex > idxGet(matchIndex, from, 0))
+            matchIndex[from] = rpc.lastIncludedIndex;
+        nextIndex[from] = idxGet(matchIndex, from, 0) + 1;
+        advanceCommit();
+        if (idxGet(nextIndex, from, 1) <= storage.lastIndex)
+            sendAppendTo(from);
     }
 
     private void advanceCommit() nothrow
@@ -521,6 +592,18 @@ struct RaftNode
     private void emitAer(NodeId to, AppendEntriesReply m) nothrow
     {
         RaftMessage msg = {to: to, type: MessageType.appendEntriesReply, aer: m};
+        outbox ~= msg;
+    }
+
+    private void emitIs(NodeId to, InstallSnapshot m) nothrow
+    {
+        RaftMessage msg = {to: to, type: MessageType.installSnapshot, is_: m};
+        outbox ~= msg;
+    }
+
+    private void emitIsr(NodeId to, InstallSnapshotReply m) nothrow
+    {
+        RaftMessage msg = {to: to, type: MessageType.installSnapshotReply, isr: m};
         outbox ~= msg;
     }
 }
