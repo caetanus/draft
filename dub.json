@@ -1,0 +1,25 @@
+{
+	"authors": [
+		"Marcelo Aires Caetano"
+	],
+	"configurations": [
+		{
+			"name": "library",
+			"targetType": "library"
+		},
+		{
+			"dependencies": {
+				"fluent-asserts": "*",
+				"unit-threaded": "*"
+			},
+			"name": "unittest",
+			"targetName": "raft_tests",
+			"targetType": "library"
+		}
+	],
+	"copyright": "Copyright © 2026, Marcelo Aires Caetano",
+	"description": "Raft consensus for D — zero-GC, transport- and storage-agnostic. Built for dreads.",
+	"license": "MIT",
+	"name": "raft",
+	"targetType": "library"
+}
