@@ -9,11 +9,15 @@ ecosystem, so this one is being built from scratch — primarily for
 - **Zero-GC**: like dreads, the hot path must not allocate on the D GC heap.
   Entries carry opaque `const(ubyte)[]` payloads (dreads feeds it raw RESP
   commands — the same bytes its AOF logs).
-- **Transport- and storage-agnostic**: `raft.transport` and `raft.storage`
-  are interfaces; dreads plugs vibe-core sockets and its segmented command
-  log into them. The library owns only the consensus state machine.
-- **Deterministic core**: no wall clock inside the algorithm; election
-  timeouts and heartbeats are driven by the host calling `tick()`.
+- **Runs on vibe-core**: the library depends on vibe-core for timers
+  (election timeout, heartbeat) and ships a TCP transport
+  (`raft.vibetransport`). `raft.transport` stays an interface so tests can
+  run whole clusters in-memory and deterministically.
+- **Storage-agnostic**: `raft.storage` is an interface; dreads plugs its
+  segmented command log into it.
+- **Deterministic core**: the algorithm itself has no wall clock; timeouts
+  and heartbeats arrive through `tick()`, which the vibe timer drives in
+  production and tests drive by hand.
 
 ## Status
 
