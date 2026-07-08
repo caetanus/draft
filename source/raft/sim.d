@@ -1,14 +1,14 @@
 module raft.sim;
 
-// Deterministic cluster simulator: in-memory storage and transport, a manual
-// clock, seeded message loss and explicit partitions/crashes. This is how
-// consensus gets tested honestly — whole clusters replayed tick by tick,
-// with the paper's invariants checked after every step. Public (not just
-// test code): hosts can use it to model failure scenarios.
+// Deterministic cluster simulator driving nodes through the Ready pattern:
+// tick → deliver inputs → for each node {takeReady, onPersisted, route
+// messages, apply committed} → check invariants. In-memory storage is always
+// instantly durable, so onPersisted is called immediately; the durability
+// *ordering* is a production I/O concern (dreads' RaftLog), not a
+// consensus-algorithm one. The paper's invariants are asserted every step.
 
 import raft.node;
 import raft.storage : Storage;
-import raft.transport : Transport;
 import raft.types;
 
 final class MemoryStorage : Storage
@@ -71,64 +71,10 @@ nothrow:
     }
 }
 
-private enum MsgKind
+private struct Envelope
 {
-    requestVote,
-    requestVoteReply,
-    appendEntries,
-    appendEntriesReply
-}
-
-private struct Msg
-{
-    NodeId from, to;
-    MsgKind kind;
-    RequestVote rv;
-    RequestVoteReply rvr;
-    AppendEntries ae;
-    AppendEntriesReply aer;
-}
-
-final class SimTransport : Transport
-{
-    Cluster cluster;
-    NodeId self;
-
-    this(Cluster c, NodeId id) nothrow
-    {
-        cluster = c;
-        self = id;
-    }
-
-nothrow:
-    void sendRequestVote(NodeId to, const ref RequestVote rpc)
-    {
-        Msg m = {from: self, to: to, kind: MsgKind.requestVote, rv: rpc};
-        cluster.post(m);
-    }
-
-    void sendRequestVoteReply(NodeId to, const ref RequestVoteReply rpc)
-    {
-        Msg m = {from: self, to: to, kind: MsgKind.requestVoteReply, rvr: rpc};
-        cluster.post(m);
-    }
-
-    void sendAppendEntries(NodeId to, const ref AppendEntries rpc)
-    {
-        // deep-copy entries: the wire serializes, slices must not alias
-        auto copy = new LogEntry[rpc.entries.length];
-        foreach (i, ref e; rpc.entries)
-            copy[i] = LogEntry(e.term, e.index, e.payload.dup);
-        Msg m = {from: self, to: to, kind: MsgKind.appendEntries, ae: AppendEntries(rpc.term,
-                rpc.leaderId, rpc.prevLogIndex, rpc.prevLogTerm, rpc.leaderCommit, copy)};
-        cluster.post(m);
-    }
-
-    void sendAppendEntriesReply(NodeId to, const ref AppendEntriesReply rpc)
-    {
-        Msg m = {from: self, to: to, kind: MsgKind.appendEntriesReply, aer: rpc};
-        cluster.post(m);
-    }
+    NodeId from;
+    RaftMessage msg;
 }
 
 final class Cluster
@@ -138,13 +84,13 @@ final class Cluster
     RaftNode*[] nodes; // index 0 = node id 1
     bool[] alive;
     bool[][] linked; // linked[a][b]: can a's messages reach b?
-    private Msg[] queue;
+    private Envelope[] queue;
     private ulong rng;
     uint dropPercent; // seeded random message loss
 
-    // invariant bookkeeping
     private NodeId[Term] leaderOfTerm;
-    private const(ubyte)[][] appliedLog; // globally applied payloads, in order
+    private const(ubyte)[][] appliedLog;
+    private size_t[] appliedPositionsStore;
     Index highestCommitSeen;
 
     this(size_t n, ulong seed = 42) nothrow
@@ -169,20 +115,13 @@ final class Cluster
     {
         NodeId[] peers;
         foreach (j; 0 .. n)
-        {
             if (j != i)
                 peers ~= cast(NodeId)(j + 1);
-        }
         Config cfg;
         cfg.self = cast(NodeId)(i + 1);
         cfg.peers = peers;
         cfg.seed = rng + i * 7919;
-        nodes[i] = new RaftNode(cfg, storages[i], new SimTransport(this, cfg.self));
-    }
-
-    void post(Msg m) nothrow
-    {
-        queue ~= m;
+        nodes[i] = new RaftNode(cfg, storages[i]);
     }
 
     private ulong nextRand() nothrow
@@ -200,18 +139,15 @@ final class Cluster
         alive[id - 1] = false;
     }
 
-    /// Restart from persisted state (same storage, fresh volatile state).
     void restart(NodeId id) nothrow
     {
-        spawn(id - 1);
+        spawn(id - 1); // fresh volatile state, same (persisted) storage
         alive[id - 1] = true;
     }
 
-    /// Splits the cluster: nodes in `side` can only talk among themselves.
     void partition(scope const(NodeId)[] side) nothrow
     {
         foreach (a; 0 .. n)
-        {
             foreach (b; 0 .. n)
             {
                 bool aIn = false, bIn = false;
@@ -222,7 +158,6 @@ final class Cluster
                 }
                 linked[a][b] = aIn == bIn;
             }
-        }
     }
 
     void heal() nothrow
@@ -233,63 +168,78 @@ final class Cluster
 
     // --- clock ---
 
-    /// One tick on every live node, then full message delivery.
+    /// One tick on every live node, deliver queued inputs, harvest each
+    /// node's Ready (persist → onPersisted → route → apply).
     void step()
     {
         foreach (i; 0 .. n)
-        {
             if (alive[i])
                 nodes[i].tick();
+        deliverQueued();
+        foreach (i; 0 .. n)
+        {
+            if (!alive[i])
+                continue;
+            auto rd = nodes[i].takeReady();
+            // memory storage is already durable; production RaftLog fsyncs here
+            nodes[i].onPersisted(rd.persistUpto);
+            foreach (ref m; rd.messages)
+                route(cast(NodeId)(i + 1), m);
+            drainApplied(i);
         }
-        deliver();
-        drainApplied();
         checkInvariants();
     }
 
-    void deliver()
+    private void deliverQueued()
     {
-        // queue grows while delivering (replies); drain to a fixpoint
-        while (queue.length)
+        auto batch = queue;
+        queue = null;
+        foreach (ref env; batch)
         {
-            auto batch = queue;
-            queue = null;
-            foreach (ref m; batch)
+            auto t = env.msg.to - 1;
+            if (!alive[t] || !linked[env.from - 1][t])
+                continue;
+            if (dropPercent && nextRand() % 100 < dropPercent)
+                continue;
+            final switch (env.msg.type)
             {
-                auto t = m.to - 1;
-                if (!alive[t] || !linked[m.from - 1][t])
-                    continue;
-                if (dropPercent && nextRand() % 100 < dropPercent)
-                    continue;
-                final switch (m.kind)
-                {
-                case MsgKind.requestVote:
-                    nodes[t].onRequestVote(m.from, m.rv);
-                    break;
-                case MsgKind.requestVoteReply:
-                    nodes[t].onRequestVoteReply(m.from, m.rvr);
-                    break;
-                case MsgKind.appendEntries:
-                    nodes[t].onAppendEntries(m.from, m.ae);
-                    break;
-                case MsgKind.appendEntriesReply:
-                    nodes[t].onAppendEntriesReply(m.from, m.aer);
-                    break;
-                }
+            case MessageType.requestVote:
+                nodes[t].onRequestVote(env.from, env.msg.rv);
+                break;
+            case MessageType.requestVoteReply:
+                nodes[t].onRequestVoteReply(env.from, env.msg.rvr);
+                break;
+            case MessageType.appendEntries:
+                nodes[t].onAppendEntries(env.from, env.msg.ae);
+                break;
+            case MessageType.appendEntriesReply:
+                nodes[t].onAppendEntriesReply(env.from, env.msg.aer);
+                break;
             }
         }
+    }
+
+    private void route(NodeId from, ref RaftMessage m) nothrow
+    {
+        // deep-copy AppendEntries payloads: the "wire" must not alias storage
+        if (m.type == MessageType.appendEntries)
+        {
+            auto copy = new LogEntry[m.ae.entries.length];
+            foreach (k, ref e; m.ae.entries)
+                copy[k] = LogEntry(e.term, e.index, e.payload.dup);
+            m.ae.entries = copy;
+        }
+        queue ~= Envelope(from, m);
     }
 
     NodeId leader() nothrow
     {
         foreach (i; 0 .. n)
-        {
             if (alive[i] && nodes[i].currentRole == Role.leader)
                 return cast(NodeId)(i + 1);
-        }
         return 0;
     }
 
-    /// Runs steps until a leader exists (and the cluster is quiet) or maxSteps.
     bool electLeader(size_t maxSteps = 200)
     {
         foreach (_; 0 .. maxSteps)
@@ -307,37 +257,28 @@ final class Cluster
         return l == 0 ? 0 : nodes[l - 1].propose(payload);
     }
 
-    // --- invariants (checked every step) ---
+    // --- invariants ---
 
-    private void drainApplied()
-    {
-        foreach (i; 0 .. n)
-        {
-            if (!alive[i])
-                continue;
-            foreach (ref e; nodes[i].takeCommitted())
-            {
-                if (e.payload == NOOP_PAYLOAD)
-                    continue;
-                // State Machine Safety: everyone applies the same sequence.
-                // Track the longest applied prefix globally and require each
-                // node's next application to extend or match it.
-                auto pos = appliedPositions[i]++;
-                if (pos < appliedLog.length)
-                    assert(appliedLog[pos] == e.payload,
-                            "state machine safety violated: divergent apply");
-                else
-                    appliedLog ~= e.payload.dup;
-            }
-        }
-    }
-
-    private size_t[] appliedPositionsStore;
     private @property size_t[] appliedPositions() nothrow
     {
         if (appliedPositionsStore.length != n)
             appliedPositionsStore = new size_t[n];
         return appliedPositionsStore;
+    }
+
+    private void drainApplied(size_t i)
+    {
+        foreach (ref e; nodes[i].takeCommitted())
+        {
+            if (e.payload == NOOP_PAYLOAD)
+                continue;
+            auto pos = appliedPositions[i]++;
+            if (pos < appliedLog.length)
+                assert(appliedLog[pos] == e.payload,
+                        "state machine safety violated: divergent apply");
+            else
+                appliedLog ~= e.payload.dup;
+        }
     }
 
     private void checkInvariants()
@@ -354,9 +295,8 @@ final class Cluster
             else
                 leaderOfTerm[t] = cast(NodeId)(i + 1);
         }
-        // Log Matching: same (index, term) => same payload and same prefix
+        // Log Matching: same (index, term) => same prefix
         foreach (a; 0 .. n)
-        {
             foreach (b; a + 1 .. n)
             {
                 auto la = storages[a].entriesFrom(1, size_t.max);
@@ -366,7 +306,6 @@ final class Cluster
                 {
                     if (la[k].term == lb[k].term)
                     {
-                        // highest common (index, term): everything below must match
                         foreach (j; 0 .. k + 1)
                             assert(la[j].term == lb[j].term && la[j].payload == lb[j].payload,
                                     "log matching violated");
@@ -374,16 +313,11 @@ final class Cluster
                     }
                 }
             }
-        }
-        // Leader Completeness proxy: committed entries never change
         foreach (i; 0 .. n)
-        {
             if (alive[i] && nodes[i].commitIndex > highestCommitSeen)
                 highestCommitSeen = nodes[i].commitIndex;
-        }
     }
 
-    /// All live nodes applied everything committed and logs converged.
     bool converged() nothrow
     {
         auto l = leader();
@@ -400,7 +334,6 @@ final class Cluster
         return true;
     }
 
-    /// Applied payload count (excluding no-ops).
     @property size_t appliedCount() const nothrow
     {
         return appliedLog.length;

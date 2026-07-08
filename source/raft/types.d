@@ -52,3 +52,38 @@ struct AppendEntriesReply
     bool success;
     Index matchIndex; // highest index known replicated on the follower
 }
+
+// --- Ready pattern (etcd/raft style) ---
+//
+// The node never does I/O itself. It accumulates outgoing messages and tells
+// the host how far the log must be persisted; the host then, IN ORDER:
+//   1. fsyncs the log up to persistUpto (and any hard-state change)
+//   2. calls node.onPersisted(persistUpto) — self only counts toward commit
+//      once its own entries are durable
+//   3. sends the messages (a follower thus never acks before durable)
+//   4. applies the newly committed entries
+// This is what makes async durability correct.
+
+enum MessageType : ubyte
+{
+    requestVote,
+    requestVoteReply,
+    appendEntries,
+    appendEntriesReply
+}
+
+struct RaftMessage
+{
+    NodeId to;
+    MessageType type;
+    RequestVote rv;
+    RequestVoteReply rvr;
+    AppendEntries ae;
+    AppendEntriesReply aer;
+}
+
+struct Ready
+{
+    RaftMessage[] messages; // send only after persistUpto is durable
+    Index persistUpto; // log is written up to here; host must make it durable
+}
