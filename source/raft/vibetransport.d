@@ -2,12 +2,11 @@ module raft.vibetransport;
 
 // Production transport over vibe-core TCP. One outbound connection per peer
 // (lazily connected, retried with backoff) plus an inbound listener. Sending
-// never yields: node.sendX() encodes and appends to a per-peer outbox, and a
-// writer fiber drains it — so the node's synchronous processing is never
-// interrupted mid-message. Received frames are decoded and handed to a
-// message handler the host installs (which drives the RaftNode, then gates
-// replies on durability). Message loss on a dead connection is fine: Raft
-// retries via heartbeats and nextIndex backup.
+// never yields: encode -> per-peer outbox -> writer fiber drains, so node
+// processing is never interrupted mid-message. Received frames are decoded
+// and handed to a MessageHandler the host installs (which drives the node,
+// then gates replies on durability). Message loss on a dead connection is
+// fine: Raft retries via heartbeats and nextIndex backup.
 
 import core.time : msecs;
 
@@ -16,7 +15,6 @@ import vibe.core.net : connectTCP, listenTCP, TCPConnection;
 import vibe.core.stream : IOMode;
 import vibe.core.sync : createManualEvent, LocalManualEvent;
 
-import raft.transport : Transport;
 import raft.types;
 import raft.wire;
 
@@ -27,11 +25,12 @@ struct PeerAddress
     ushort port;
 }
 
-/// The host installs this: decode already done, drive the node here.
+/// The raft body ([kind][fields], sender already stripped) is handed here.
 alias MessageHandler = void delegate(NodeId from, MsgKind kind, scope const(ubyte)[] body_) nothrow;
 
-final class VibeTransport : Transport
+final class VibeTransport
 {
+    private NodeId self;
     private PeerAddress[] peers;
     private MessageHandler onMessage;
     private Peer[NodeId] peerState;
@@ -46,8 +45,9 @@ final class VibeTransport : Transport
         LocalManualEvent hasData;
     }
 
-    this(PeerAddress[] peers)
+    this(NodeId self, PeerAddress[] peers)
     {
+        this.self = self;
         this.peers = peers;
         foreach (ref p; peers)
         {
@@ -63,7 +63,6 @@ final class VibeTransport : Transport
         onMessage = h;
     }
 
-    /// Binds the listener and starts the per-peer connect/write loops.
     void start(ushort listenPort)
     {
         running = true;
@@ -81,7 +80,27 @@ final class VibeTransport : Transport
         running = false;
     }
 
-    // --- outbound: encode, enqueue, signal (never yields) ---
+    /// Encode a node output and enqueue to its target (never yields).
+    void send(const ref RaftMessage m) nothrow
+    {
+        ubyte[] framed;
+        final switch (m.type)
+        {
+        case MessageType.requestVote:
+            framed = encodeRequestVote(self, m.rv);
+            break;
+        case MessageType.requestVoteReply:
+            framed = encodeRequestVoteReply(self, m.rvr);
+            break;
+        case MessageType.appendEntries:
+            framed = encodeAppendEntries(self, m.ae);
+            break;
+        case MessageType.appendEntriesReply:
+            framed = encodeAppendEntriesReply(self, m.aer);
+            break;
+        }
+        enqueue(m.to, framed);
+    }
 
     private void enqueue(NodeId to, scope const(ubyte)[] framed) nothrow
     {
@@ -91,27 +110,6 @@ final class VibeTransport : Transport
         auto st = *pp;
         st.outbox ~= framed;
         st.hasData.emit();
-    }
-
-nothrow:
-    void sendRequestVote(NodeId to, const ref RequestVote rpc)
-    {
-        enqueue(to, encodeRequestVote(rpc));
-    }
-
-    void sendRequestVoteReply(NodeId to, const ref RequestVoteReply rpc)
-    {
-        enqueue(to, encodeRequestVoteReply(rpc));
-    }
-
-    void sendAppendEntries(NodeId to, const ref AppendEntries rpc)
-    {
-        enqueue(to, encodeAppendEntries(rpc));
-    }
-
-    void sendAppendEntriesReply(NodeId to, const ref AppendEntriesReply rpc)
-    {
-        enqueue(to, encodeAppendEntriesReply(rpc));
     }
 
     // --- connection lifecycle ---
@@ -158,7 +156,7 @@ nothrow:
                     st.conn.write(batch);
                 catch (Exception)
                 {
-                    st.connected = false; // drop: Raft will retry
+                    st.connected = false; // drop: Raft retries
                 }
             }
             else
@@ -199,7 +197,6 @@ nothrow:
         }
     }
 
-    /// Pulls complete [u32 len][body] frames out of the buffer.
     private void consumeFrames(ref ubyte[] buf) nothrow
     {
         size_t pos = 0;
@@ -208,28 +205,28 @@ nothrow:
             uint len = buf[pos] | (cast(uint) buf[pos + 1] << 8)
                 | (cast(uint) buf[pos + 2] << 16) | (cast(uint) buf[pos + 3] << 24);
             if (len > 64 * 1024 * 1024)
-                break; // absurd frame: give up on this connection's stream
+                break;
             if (buf.length - pos - 4 < len)
                 break; // incomplete
-            auto body_ = buf[pos + 4 .. pos + 4 + len];
-            dispatchFrame(body_);
+            dispatchFrame(buf[pos + 4 .. pos + 4 + len]);
             pos += 4 + len;
         }
         if (pos > 0)
             buf = buf[pos .. $];
     }
 
-    private void dispatchFrame(scope const(ubyte)[] body_) nothrow
+    private void dispatchFrame(scope const(ubyte)[] frameBody) nothrow
     {
-        if (onMessage is null || body_.length == 0)
+        if (onMessage is null)
             return;
+        NodeId sender;
         bool ok;
+        auto body_ = splitSender(frameBody, sender, ok);
+        if (!ok || body_.length == 0)
+            return;
         auto kind = peekKind(body_, ok);
         if (!ok)
             return;
-        // the sender id travels inside each RPC (candidateId/leaderId); replies
-        // are matched by the node via term/context, so the handler resolves
-        // `from` from the decoded message. We pass 0 and let the handler decode.
-        onMessage(0, kind, body_);
+        onMessage(sender, kind, body_);
     }
 }

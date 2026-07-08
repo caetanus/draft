@@ -1,15 +1,15 @@
 module raft.node;
 
-// The consensus state machine (Raft, §5) in the Ready pattern: the node does
-// NO I/O. It reads/writes the log via the Storage interface but never sends —
-// it accumulates outgoing messages and reports how far the log must be made
-// durable. The host drives it and, in order, persists → onPersisted → sends →
-// applies. This is what makes asynchronous durability correct: a follower
-// never acknowledges before its append is durable, and the leader counts
-// itself toward commit only once its own entries are on disk.
+// The consensus state machine (Raft §5 + §6 joint-consensus membership) in
+// the Ready pattern: the node does NO I/O. It reads/writes the log via the
+// Storage interface, accumulates outgoing messages, and reports how far the
+// log must be durable; the host persists -> onPersisted -> sends -> applies.
 //
-// Deterministic: no wall clock, tick-driven, election timeouts from a seeded
-// PRNG — so whole clusters simulate and replay exactly.
+// Membership is dynamic: the active configuration is derived from the log
+// (config entries take effect when appended, §6). A change goes joint
+// (C_old,new) — needing dual majorities — then final (C_new).
+//
+// Deterministic: no wall clock, tick-driven, seeded election-timeout PRNG.
 
 import raft.storage : Storage;
 import raft.types;
@@ -17,33 +17,36 @@ import raft.types;
 struct Config
 {
     NodeId self;
-    NodeId[] peers; // the other nodes (self excluded)
-    uint electionTimeoutTicks = 10; // randomized per cycle into [t, 2t)
+    NodeId[] peers; // bootstrap peers (the other founding members)
+    uint electionTimeoutTicks = 10;
     uint heartbeatTicks = 2;
-    ulong seed = 1; // election-timeout PRNG seed (determinism)
+    ulong seed = 1;
 }
 
-/// Marks entries a new leader appends to commit prior-term entries (§5.4.2).
-/// Hosts skip these when applying.
 enum NOOP_PAYLOAD = cast(const(ubyte)[]) "\0raft-noop";
 
 struct RaftNode
 {
-    private Config cfg;
+    private NodeId self;
+    private uint electionTimeoutTicks;
+    private uint heartbeatTicks;
     private Storage storage;
 
-    // volatile state (§5)
     private Role role_ = Role.follower;
     private NodeId leaderId_;
     private Index commitIndex_;
     private Index lastApplied;
-    private Index persistedIndex_; // host-confirmed durable log index (self-match)
-    private Index[] nextIndex;
-    private Index[] matchIndex;
-    private bool[] voteFrom;
-    // Ready outputs
+    private Index persistedIndex_;
+    private Index[NodeId] nextIndex;
+    private Index[NodeId] matchIndex;
+    private bool[NodeId] voteFrom;
     private RaftMessage[] outbox;
-    // timers
+
+    // membership
+    private Configuration activeConfig;
+    private Configuration bootstrapConfig;
+    private Index configEntryIndex; // log index of the active config entry (0 = bootstrap)
+
     private uint sinceHeard;
     private uint electionDeadline;
     private uint heartbeatCounter;
@@ -51,13 +54,15 @@ struct RaftNode
 
     this(Config cfg, Storage storage) nothrow
     {
-        this.cfg = cfg;
+        this.self = cfg.self;
+        this.electionTimeoutTicks = cfg.electionTimeoutTicks;
+        this.heartbeatTicks = cfg.heartbeatTicks;
         this.storage = storage;
         this.rng = cfg.seed | 1;
-        nextIndex = new Index[cfg.peers.length];
-        matchIndex = new Index[cfg.peers.length];
-        voteFrom = new bool[cfg.peers.length];
-        persistedIndex_ = storage.lastIndex; // recovered log is already durable
+        bootstrapConfig.cNew = cfg.self ~ cfg.peers;
+        activeConfig = bootstrapConfig;
+        persistedIndex_ = storage.lastIndex;
+        refreshConfigFromLog(); // recover the latest config entry, if any
         resetElectionDeadline();
     }
 
@@ -76,10 +81,15 @@ struct RaftNode
         return commitIndex_;
     }
 
+    /// The current voting members (the new config; during a joint config this
+    /// is the target set).
+    const(NodeId)[] members() const nothrow
+    {
+        return activeConfig.cNew;
+    }
+
     // --- Ready pattern host interface ---
 
-    /// Collects everything produced since the last call. The host must make
-    /// the log durable up to `persistUpto` before sending `messages`.
     Ready takeReady() nothrow
     {
         Ready rd;
@@ -89,8 +99,6 @@ struct RaftNode
         return rd;
     }
 
-    /// The host confirms the log is durable up to `index`. Only now may the
-    /// leader count itself toward commit.
     void onPersisted(Index index) nothrow
     {
         if (index > persistedIndex_)
@@ -99,7 +107,6 @@ struct RaftNode
             advanceCommit();
     }
 
-    /// Entries newly committed since the last call, in order (skip NOOP).
     const(LogEntry)[] takeCommitted() nothrow
     {
         if (lastApplied >= commitIndex_)
@@ -109,6 +116,23 @@ struct RaftNode
         return batch;
     }
 
+    // --- membership change (leader only) ---
+
+    /// Begins a joint transition from the active config to `newMembers`.
+    /// Returns false when not leader or a change is already in flight.
+    bool changeMembership(scope const(NodeId)[] newMembers) nothrow
+    {
+        if (role_ != Role.leader || activeConfig.joint)
+            return false;
+        Configuration joint;
+        joint.cOld = activeConfig.cNew.dup;
+        joint.cNew = newMembers.dup;
+        auto payload = encodeConfig(joint);
+        appendLog(storage.currentTerm, payload);
+        broadcastAppend();
+        return true;
+    }
+
     // --- host clock ---
 
     void tick() nothrow
@@ -116,11 +140,10 @@ struct RaftNode
         if (role_ == Role.leader)
         {
             heartbeatCounter++;
-            if (heartbeatCounter >= cfg.heartbeatTicks)
+            if (heartbeatCounter >= heartbeatTicks)
             {
                 heartbeatCounter = 0;
-                foreach (i; 0 .. cfg.peers.length)
-                    sendAppendTo(i);
+                broadcastAppend();
             }
             return;
         }
@@ -129,20 +152,16 @@ struct RaftNode
             startElection();
     }
 
-    /// Leader entry point. Returns the assigned index, or 0 when not leader.
     Index propose(scope const(ubyte)[] payload) nothrow
     {
         if (role_ != Role.leader)
             return 0;
-        auto idx = storage.lastIndex + 1;
-        LogEntry[1] e = [LogEntry(storage.currentTerm, idx, payload)];
-        storage.append(e[]);
-        foreach (i; 0 .. cfg.peers.length)
-            sendAppendTo(i);
+        auto idx = appendLog(storage.currentTerm, payload);
+        broadcastAppend();
         return idx;
     }
 
-    // --- RPC ingress (host decodes the wire and calls these) ---
+    // --- RPC ingress ---
 
     void onRequestVote(NodeId from, const ref RequestVote rpc) nothrow
     {
@@ -160,7 +179,7 @@ struct RaftNode
         }
         if (grant)
         {
-            storage.setVotedFor(rpc.candidateId); // durable (rare; storage syncs meta)
+            storage.setVotedFor(rpc.candidateId);
             sinceHeard = 0;
             resetElectionDeadline();
         }
@@ -176,14 +195,8 @@ struct RaftNode
         }
         if (role_ != Role.candidate || rpc.term != storage.currentTerm || !rpc.voteGranted)
             return;
-        auto pi = peerPos(from);
-        if (pi < 0 || voteFrom[pi])
-            return;
-        voteFrom[pi] = true;
-        size_t votes = 1;
-        foreach (v; voteFrom)
-            votes += v ? 1 : 0;
-        if (votes * 2 > cfg.peers.length + 1)
+        voteFrom[from] = true;
+        if (haveElectionMajority())
             becomeLeader();
     }
 
@@ -220,17 +233,17 @@ struct RaftNode
                     continue;
                 storage.truncateFrom(e.index);
                 if (persistedIndex_ >= e.index)
-                    persistedIndex_ = e.index - 1; // truncated entries are no longer durable
+                    persistedIndex_ = e.index - 1;
+                refreshConfigFromLog(); // truncation may revert the config
             }
             storage.append(rpc.entries[k .. $]);
+            noteAppended(rpc.entries[k .. $]);
             break;
         }
         auto lastNew = rpc.prevLogIndex + rpc.entries.length;
         if (rpc.leaderCommit > commitIndex_)
             commitIndex_ = rpc.leaderCommit < lastNew ? rpc.leaderCommit
                 : (lastNew > commitIndex_ ? lastNew : commitIndex_);
-        // the reply reports how much we hold; the host sends it only after the
-        // append is durable (Ready pattern), so success means durable
         emitAer(from, AppendEntriesReply(storage.currentTerm, true, lastNew));
     }
 
@@ -243,30 +256,249 @@ struct RaftNode
         }
         if (role_ != Role.leader || rpc.term != storage.currentTerm)
             return;
-        auto pi = peerPos(from);
-        if (pi < 0)
-            return;
         if (rpc.success)
         {
-            if (rpc.matchIndex > matchIndex[pi])
-                matchIndex[pi] = rpc.matchIndex;
-            nextIndex[pi] = matchIndex[pi] + 1;
+            if (rpc.matchIndex > idxGet(matchIndex, from, 0))
+                matchIndex[from] = rpc.matchIndex;
+            nextIndex[from] = matchIndex[from] + 1;
             advanceCommit();
-            if (nextIndex[pi] <= storage.lastIndex)
-                sendAppendTo(pi);
+            if (nextIndex[from] <= storage.lastIndex)
+                sendAppendTo(from);
         }
         else
         {
             auto hinted = rpc.matchIndex + 1;
-            auto stepped = nextIndex[pi] > 1 ? nextIndex[pi] - 1 : 1;
-            nextIndex[pi] = hinted < stepped ? hinted : stepped;
-            if (nextIndex[pi] < 1)
-                nextIndex[pi] = 1;
-            sendAppendTo(pi);
+            auto cur = idxGet(nextIndex, from, 1);
+            auto stepped = cur > 1 ? cur - 1 : 1;
+            auto nv = hinted < stepped ? hinted : stepped;
+            nextIndex[from] = nv < 1 ? 1 : nv;
+            sendAppendTo(from);
         }
     }
 
-    // --- message emission (into the Ready outbox, never inline I/O) ---
+    // --- config derivation from the log ---
+
+    private Index appendLog(Term term, scope const(ubyte)[] payload) nothrow
+    {
+        auto idx = storage.lastIndex + 1;
+        LogEntry[1] e = [LogEntry(term, idx, payload)];
+        storage.append(e[]);
+        noteAppended(e[]);
+        return idx;
+    }
+
+    private void noteAppended(scope const(LogEntry)[] batch) nothrow
+    {
+        foreach (ref e; batch)
+            if (isConfigEntry(e.payload))
+            {
+                activeConfig = decodeConfig(e.payload);
+                configEntryIndex = e.index;
+            }
+    }
+
+    private void refreshConfigFromLog() nothrow
+    {
+        auto last = storage.lastIndex;
+        for (auto i = last; i >= 1; i--)
+        {
+            auto es = storage.entriesFrom(i, 1);
+            if (es.length && isConfigEntry(es[0].payload))
+            {
+                activeConfig = decodeConfig(es[0].payload);
+                configEntryIndex = i;
+                return;
+            }
+        }
+        activeConfig = bootstrapConfig;
+        configEntryIndex = 0;
+    }
+
+    // --- majorities over the (possibly joint) configuration ---
+
+    private bool countMajority(scope const(NodeId)[] set, scope bool delegate(NodeId) nothrow has) nothrow
+    {
+        if (set.length == 0)
+            return true;
+        size_t c = 0;
+        foreach (m; set)
+            if (has(m))
+                c++;
+        return c * 2 > set.length;
+    }
+
+    private bool haveElectionMajority() nothrow
+    {
+        bool voted(NodeId m) nothrow
+        {
+            return m == self ? true : boolGet(voteFrom, m);
+        }
+
+        return countMajority(activeConfig.cNew, &voted)
+            && (!activeConfig.joint || countMajority(activeConfig.cOld, &voted));
+    }
+
+    private bool replicatedOn(Index n) nothrow
+    {
+        bool has(NodeId m) nothrow
+        {
+            return m == self ? persistedIndex_ >= n : idxGet(matchIndex, m, 0) >= n;
+        }
+
+        return countMajority(activeConfig.cNew, &has)
+            && (!activeConfig.joint || countMajority(activeConfig.cOld, &has));
+    }
+
+    // --- internals ---
+
+    private void broadcastAppend() nothrow
+    {
+        foreach (m; otherServers())
+            sendAppendTo(m);
+    }
+
+    private NodeId[] otherServers() nothrow
+    {
+        NodeId[] out_;
+        foreach (m; activeConfig.cNew)
+            if (m != self)
+                out_ ~= m;
+        foreach (m; activeConfig.cOld)
+            if (m != self && !contains(out_, m))
+                out_ ~= m;
+        return out_;
+    }
+
+
+    private Index idxGet(const ref Index[NodeId] m, NodeId k, Index dflt) nothrow
+    {
+        auto p = k in m;
+        return p ? *p : dflt;
+    }
+
+    private bool boolGet(const ref bool[NodeId] m, NodeId k) nothrow
+    {
+        auto p = k in m;
+        return p ? *p : false;
+    }
+
+    private static bool contains(scope const(NodeId)[] s, NodeId id) nothrow
+    {
+        foreach (x; s)
+            if (x == id)
+                return true;
+        return false;
+    }
+
+    private ulong nextRand() nothrow
+    {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        return rng;
+    }
+
+    private void resetElectionDeadline() nothrow
+    {
+        electionDeadline = electionTimeoutTicks + cast(uint)(nextRand() % electionTimeoutTicks);
+    }
+
+    private void stepDown(Term newTerm) nothrow
+    {
+        storage.setCurrentTerm(newTerm);
+        storage.setVotedFor(0);
+        role_ = Role.follower;
+        leaderId_ = 0;
+        sinceHeard = 0;
+        resetElectionDeadline();
+    }
+
+    private void startElection() nothrow
+    {
+        // a server removed from the configuration stops trying to lead
+        if (!activeConfig.contains(self))
+            return;
+        storage.setCurrentTerm(storage.currentTerm + 1);
+        storage.setVotedFor(self);
+        role_ = Role.candidate;
+        leaderId_ = 0;
+        voteFrom = null;
+        voteFrom[self] = true;
+        sinceHeard = 0;
+        resetElectionDeadline();
+        auto others = otherServers();
+        if (others.length == 0)
+        {
+            if (haveElectionMajority())
+                becomeLeader();
+            return;
+        }
+        auto lastIdx = storage.lastIndex;
+        auto rpc = RequestVote(storage.currentTerm, self, lastIdx,
+                lastIdx > 0 ? storage.termAt(lastIdx) : 0);
+        foreach (m; others)
+            emitRv(m, rpc);
+    }
+
+    private void becomeLeader() nothrow
+    {
+        role_ = Role.leader;
+        leaderId_ = self;
+        heartbeatCounter = 0;
+        nextIndex = null;
+        matchIndex = null;
+        foreach (m; otherServers())
+        {
+            nextIndex[m] = storage.lastIndex + 1;
+            matchIndex[m] = 0;
+        }
+        appendLog(storage.currentTerm, NOOP_PAYLOAD); // §5.4.2
+        broadcastAppend();
+    }
+
+    private void sendAppendTo(NodeId to) nothrow
+    {
+        enum MAX_BATCH = 64;
+        auto ni = idxGet(nextIndex, to, storage.lastIndex + 1);
+        auto prev = ni - 1;
+        auto rpc = AppendEntries(storage.currentTerm, self, prev,
+                prev > 0 ? storage.termAt(prev) : 0, commitIndex_, storage.entriesFrom(ni, MAX_BATCH));
+        emitAe(to, rpc);
+    }
+
+    private void advanceCommit() nothrow
+    {
+        auto last = storage.lastIndex;
+        for (auto n = last; n > commitIndex_; n--)
+        {
+            if (storage.termAt(n) != storage.currentTerm)
+                break;
+            if (replicatedOn(n))
+            {
+                commitIndex_ = n;
+                break;
+            }
+        }
+        // joint config committed -> append the final C_new
+        if (role_ == Role.leader && activeConfig.joint && configEntryIndex != 0
+                && configEntryIndex <= commitIndex_)
+        {
+            Configuration fin;
+            fin.cNew = activeConfig.cNew.dup;
+            appendLog(storage.currentTerm, encodeConfig(fin));
+            broadcastAppend();
+        }
+        // final config committed and we're no longer a member -> step down
+        else if (role_ == Role.leader && !activeConfig.joint && configEntryIndex != 0
+                && configEntryIndex <= commitIndex_ && !activeConfig.contains(self))
+        {
+            role_ = Role.follower;
+            leaderId_ = 0;
+            resetElectionDeadline();
+        }
+    }
+
+    // --- message emission ---
 
     private void emitRv(NodeId to, RequestVote m) nothrow
     {
@@ -290,108 +522,5 @@ struct RaftNode
     {
         RaftMessage msg = {to: to, type: MessageType.appendEntriesReply, aer: m};
         outbox ~= msg;
-    }
-
-    // --- internals ---
-
-    private ptrdiff_t peerPos(NodeId id) const nothrow
-    {
-        foreach (i, p; cfg.peers)
-            if (p == id)
-                return cast(ptrdiff_t) i;
-        return -1;
-    }
-
-    private ulong nextRand() nothrow
-    {
-        rng ^= rng << 13;
-        rng ^= rng >> 7;
-        rng ^= rng << 17;
-        return rng;
-    }
-
-    private void resetElectionDeadline() nothrow
-    {
-        electionDeadline = cfg.electionTimeoutTicks
-            + cast(uint)(nextRand() % cfg.electionTimeoutTicks);
-    }
-
-    private void stepDown(Term newTerm) nothrow
-    {
-        storage.setCurrentTerm(newTerm);
-        storage.setVotedFor(0);
-        role_ = Role.follower;
-        leaderId_ = 0;
-        sinceHeard = 0;
-        resetElectionDeadline();
-    }
-
-    private void startElection() nothrow
-    {
-        storage.setCurrentTerm(storage.currentTerm + 1);
-        storage.setVotedFor(cfg.self);
-        role_ = Role.candidate;
-        leaderId_ = 0;
-        voteFrom[] = false;
-        sinceHeard = 0;
-        resetElectionDeadline();
-        if (cfg.peers.length == 0)
-        {
-            becomeLeader();
-            return;
-        }
-        auto lastIdx = storage.lastIndex;
-        auto rpc = RequestVote(storage.currentTerm, cfg.self, lastIdx,
-                lastIdx > 0 ? storage.termAt(lastIdx) : 0);
-        foreach (p; cfg.peers)
-            emitRv(p, rpc);
-    }
-
-    private void becomeLeader() nothrow
-    {
-        role_ = Role.leader;
-        leaderId_ = cfg.self;
-        heartbeatCounter = 0;
-        foreach (i; 0 .. cfg.peers.length)
-        {
-            nextIndex[i] = storage.lastIndex + 1;
-            matchIndex[i] = 0;
-        }
-        // §5.4.2 own-term no-op so prior-term entries commit without traffic
-        LogEntry[1] noop = [LogEntry(storage.currentTerm, storage.lastIndex + 1, NOOP_PAYLOAD)];
-        storage.append(noop[]);
-        foreach (i; 0 .. cfg.peers.length)
-            sendAppendTo(i);
-        // commit advancement waits for onPersisted (own entries durable first)
-    }
-
-    private void sendAppendTo(size_t pi) nothrow
-    {
-        enum MAX_BATCH = 64;
-        auto prev = nextIndex[pi] - 1;
-        auto rpc = AppendEntries(storage.currentTerm, cfg.self, prev,
-                prev > 0 ? storage.termAt(prev) : 0, commitIndex_,
-                storage.entriesFrom(nextIndex[pi], MAX_BATCH));
-        emitAe(cfg.peers[pi], rpc);
-    }
-
-    /// Commit the highest own-term index replicated on a majority. Self only
-    /// counts up to persistedIndex_ (its durable prefix).
-    private void advanceCommit() nothrow
-    {
-        auto last = storage.lastIndex;
-        for (auto n = last; n > commitIndex_; n--)
-        {
-            if (storage.termAt(n) != storage.currentTerm)
-                break;
-            size_t have = persistedIndex_ >= n ? 1 : 0; // self, only if durable
-            foreach (m; matchIndex)
-                have += m >= n ? 1 : 0;
-            if (have * 2 > cfg.peers.length + 1)
-            {
-                commitIndex_ = n;
-                break;
-            }
-        }
     }
 }

@@ -111,17 +111,52 @@ final class Cluster
         }
     }
 
-    private void spawn(size_t i) nothrow
+    private void spawn(size_t i, scope const(NodeId)[] bootstrapPeers = null) nothrow
     {
         NodeId[] peers;
-        foreach (j; 0 .. n)
-            if (j != i)
-                peers ~= cast(NodeId)(j + 1);
+        if (bootstrapPeers is null)
+        {
+            foreach (j; 0 .. n)
+                if (j != i)
+                    peers ~= cast(NodeId)(j + 1);
+        }
+        else
+            peers = bootstrapPeers.dup;
         Config cfg;
         cfg.self = cast(NodeId)(i + 1);
         cfg.peers = peers;
         cfg.seed = rng + i * 7919;
         nodes[i] = new RaftNode(cfg, storages[i]);
+    }
+
+    /// Brings up a brand-new node (next id). It bootstraps with the current
+    /// members as its config but NOT itself, so it stays a passive learner
+    /// (never self-elects) until a committed joint config adds it.
+    NodeId addNode() nothrow
+    {
+        auto id = cast(NodeId)(n + 1);
+        n++;
+        storages ~= new MemoryStorage;
+        nodes ~= null;
+        alive ~= true;
+        // grow the connectivity matrix
+        foreach (ref row; linked)
+            row ~= true;
+        linked ~= new bool[n];
+        linked[n - 1][] = true;
+        NodeId[] current;
+        if (leader() != 0)
+            foreach (m; nodes[leader() - 1].members)
+                current ~= m;
+        spawn(n - 1, current);
+        return id;
+    }
+
+    /// Leader-driven membership change to `newMembers` (joint consensus).
+    bool changeMembership(scope const(NodeId)[] newMembers) nothrow
+    {
+        auto l = leader();
+        return l == 0 ? false : nodes[l - 1].changeMembership(newMembers);
     }
 
     private ulong nextRand() nothrow
@@ -261,8 +296,8 @@ final class Cluster
 
     private @property size_t[] appliedPositions() nothrow
     {
-        if (appliedPositionsStore.length != n)
-            appliedPositionsStore = new size_t[n];
+        while (appliedPositionsStore.length < n) // grow WITHOUT zeroing existing
+            appliedPositionsStore ~= 0;
         return appliedPositionsStore;
     }
 
@@ -270,7 +305,7 @@ final class Cluster
     {
         foreach (ref e; nodes[i].takeCommitted())
         {
-            if (e.payload == NOOP_PAYLOAD)
+            if (isInternalEntry(e.payload)) // config + no-op entries
                 continue;
             auto pos = appliedPositions[i]++;
             if (pos < appliedLog.length)

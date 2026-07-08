@@ -89,11 +89,15 @@ private struct Reader
     }
 }
 
-// --- encode: returns a full framed message ([len][kind][body]) ---
+// --- encode: full framed message [u32 len][u32 sender][u8 kind][fields] ---
+// The sender id travels in the envelope so replies (which carry no sender in
+// their body) can still be attributed; for requests it equals candidateId/
+// leaderId.
 
-private ubyte[] frame(MsgKind kind, scope void delegate(ref ubyte[]) nothrow body_) nothrow
+private ubyte[] frame(NodeId sender, MsgKind kind, scope void delegate(ref ubyte[]) nothrow body_) nothrow
 {
     ubyte[] payload;
+    putU32(payload, sender);
     putU8(payload, kind);
     body_(payload);
     ubyte[] out_;
@@ -102,9 +106,9 @@ private ubyte[] frame(MsgKind kind, scope void delegate(ref ubyte[]) nothrow bod
     return out_;
 }
 
-ubyte[] encodeRequestVote(const ref RequestVote m) nothrow
+ubyte[] encodeRequestVote(NodeId sender, const ref RequestVote m) nothrow
 {
-    return frame(MsgKind.requestVote, (ref o) {
+    return frame(sender, MsgKind.requestVote, (ref o) {
         putU64(o, m.term);
         putU32(o, m.candidateId);
         putU64(o, m.lastLogIndex);
@@ -112,17 +116,17 @@ ubyte[] encodeRequestVote(const ref RequestVote m) nothrow
     });
 }
 
-ubyte[] encodeRequestVoteReply(const ref RequestVoteReply m) nothrow
+ubyte[] encodeRequestVoteReply(NodeId sender, const ref RequestVoteReply m) nothrow
 {
-    return frame(MsgKind.requestVoteReply, (ref o) {
+    return frame(sender, MsgKind.requestVoteReply, (ref o) {
         putU64(o, m.term);
         putU8(o, m.voteGranted ? 1 : 0);
     });
 }
 
-ubyte[] encodeAppendEntries(const ref AppendEntries m) nothrow
+ubyte[] encodeAppendEntries(NodeId sender, const ref AppendEntries m) nothrow
 {
-    return frame(MsgKind.appendEntries, (ref o) {
+    return frame(sender, MsgKind.appendEntries, (ref o) {
         putU64(o, m.term);
         putU32(o, m.leaderId);
         putU64(o, m.prevLogIndex);
@@ -139,16 +143,31 @@ ubyte[] encodeAppendEntries(const ref AppendEntries m) nothrow
     });
 }
 
-ubyte[] encodeAppendEntriesReply(const ref AppendEntriesReply m) nothrow
+ubyte[] encodeAppendEntriesReply(NodeId sender, const ref AppendEntriesReply m) nothrow
 {
-    return frame(MsgKind.appendEntriesReply, (ref o) {
+    return frame(sender, MsgKind.appendEntriesReply, (ref o) {
         putU64(o, m.term);
         putU8(o, m.success ? 1 : 0);
         putU64(o, m.matchIndex);
     });
 }
 
-// --- decode: `body` is the post-length payload ([kind][fields]) ---
+/// Reads the sender id from a frame body ([u32 sender][kind][fields]) and
+/// returns the raft-wire body ([kind][fields]) for the decode functions.
+const(ubyte)[] splitSender(scope return const(ubyte)[] frameBody, out NodeId sender, out bool ok) nothrow
+{
+    if (frameBody.length < 5)
+    {
+        ok = false;
+        return null;
+    }
+    sender = frameBody[0] | (cast(uint) frameBody[1] << 8)
+        | (cast(uint) frameBody[2] << 16) | (cast(uint) frameBody[3] << 24);
+    ok = true;
+    return frameBody[4 .. $];
+}
+
+// --- decode: `body` is the post-sender payload ([kind][fields]) ---
 
 MsgKind peekKind(scope const(ubyte)[] body_, out bool ok) nothrow
 {
@@ -226,22 +245,26 @@ version (unittest)
 {
     import fluent.asserts;
 
-    private const(ubyte)[] body_(const(ubyte)[] framed) nothrow
+    // strip [u32 len], then [u32 sender] via splitSender, leaving [kind][fields]
+    private const(ubyte)[] body_(const(ubyte)[] framed, out NodeId sender) nothrow
     {
-        return framed[4 .. $]; // strip the u32 length prefix
+        bool ok;
+        return splitSender(framed[4 .. $], sender, ok);
     }
 
     @("wire.request_vote_roundtrip")
     unittest
     {
         RequestVote m = {term: 42, candidateId: 3, lastLogIndex: 100, lastLogTerm: 41};
-        auto f = encodeRequestVote(m);
-        // length prefix is correct
+        auto f = encodeRequestVote(7, m); // sender 7
         (f[0] | (f[1] << 8)).expect.to.equal(cast(int)(f.length - 4));
+        NodeId sender;
+        auto b = body_(f, sender);
+        sender.expect.to.equal(7U); // envelope carries the sender
         bool ok;
-        peekKind(body_(f), ok).expect.to.equal(MsgKind.requestVote);
+        peekKind(b, ok).expect.to.equal(MsgKind.requestVote);
         RequestVote got;
-        decodeRequestVote(body_(f), got).expect.to.equal(true);
+        decodeRequestVote(b, got).expect.to.equal(true);
         got.term.expect.to.equal(42UL);
         got.candidateId.expect.to.equal(3U);
         got.lastLogIndex.expect.to.equal(100UL);
@@ -251,15 +274,18 @@ version (unittest)
     @("wire.reply_roundtrips")
     unittest
     {
+        NodeId s;
         RequestVoteReply rv = {term: 7, voteGranted: true};
         RequestVoteReply gv;
-        decodeRequestVoteReply(body_(encodeRequestVoteReply(rv)), gv).expect.to.equal(true);
+        decodeRequestVoteReply(body_(encodeRequestVoteReply(2, rv), s), gv).expect.to.equal(true);
+        s.expect.to.equal(2U); // sender recovered for a reply that has none in-body
         gv.term.expect.to.equal(7UL);
         gv.voteGranted.expect.to.equal(true);
 
         AppendEntriesReply ae = {term: 9, success: false, matchIndex: 55};
         AppendEntriesReply ga;
-        decodeAppendEntriesReply(body_(encodeAppendEntriesReply(ae)), ga).expect.to.equal(true);
+        decodeAppendEntriesReply(body_(encodeAppendEntriesReply(4, ae), s), ga).expect.to.equal(true);
+        s.expect.to.equal(4U);
         ga.term.expect.to.equal(9UL);
         ga.success.expect.to.equal(false);
         ga.matchIndex.expect.to.equal(55UL);
@@ -268,7 +294,6 @@ version (unittest)
     @("wire.append_entries_with_binary_payloads")
     unittest
     {
-        // binary-safe payloads: CRLF, NUL, high bytes (raw RESP commands)
         auto p1 = cast(const(ubyte)[]) "*1\r\n$4\r\nPING\r\n";
         auto p2 = cast(const(ubyte)[]) "\x00\xff\x01binary\x00";
         LogEntry[2] es = [LogEntry(3, 10, p1), LogEntry(3, 11, p2)];
@@ -276,9 +301,10 @@ version (unittest)
             term: 3, leaderId: 1, prevLogIndex: 9, prevLogTerm: 2,
             leaderCommit: 8, entries: es[]
         };
-        auto f = encodeAppendEntries(m);
+        NodeId s;
+        auto b = body_(encodeAppendEntries(1, m), s);
         AppendEntries got;
-        decodeAppendEntries(body_(f), got).expect.to.equal(true);
+        decodeAppendEntries(b, got).expect.to.equal(true);
         got.term.expect.to.equal(3UL);
         got.leaderId.expect.to.equal(1U);
         got.prevLogIndex.expect.to.equal(9UL);
@@ -293,8 +319,9 @@ version (unittest)
     unittest
     {
         AppendEntries m = {term: 5, leaderId: 2, prevLogIndex: 3, prevLogTerm: 5, leaderCommit: 3};
+        NodeId s;
         AppendEntries got;
-        decodeAppendEntries(body_(encodeAppendEntries(m)), got).expect.to.equal(true);
+        decodeAppendEntries(body_(encodeAppendEntries(2, m), s), got).expect.to.equal(true);
         got.entries.length.expect.to.equal(0); // heartbeat carries no entries
     }
 
@@ -302,10 +329,10 @@ version (unittest)
     unittest
     {
         AppendEntries hb = {term: 1, leaderId: 1, entries: null};
-        auto f = encodeAppendEntries(hb);
-        // chop the body: decode must fail, not read out of bounds
+        NodeId s;
+        auto b = body_(encodeAppendEntries(1, hb), s);
         AppendEntries got;
-        decodeAppendEntries(body_(f)[0 .. 5], got).expect.to.equal(false);
+        decodeAppendEntries(b[0 .. 5], got).expect.to.equal(false); // chopped: no OOB
         ubyte[1] justKind = [cast(ubyte) MsgKind.requestVote];
         RequestVote rv;
         decodeRequestVote(justKind[], rv).expect.to.equal(false);
