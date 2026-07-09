@@ -363,6 +363,13 @@ struct RaftNode
             auto stepped = cur > 1 ? cur - 1 : 1;
             auto nv = hinted < stepped ? hinted : stepped;
             nextIndex[from] = nv < 1 ? 1 : nv;
+            // If the follower has backed up past the snapshot boundary it needs
+            // a snapshot; a prior InstallSnapshot may have been sent but its
+            // reply lost (leaving snapshotPending stuck). This live reject proves
+            // the follower is reachable, so clear the throttle to re-ship the
+            // snapshot now instead of waiting on a (possibly starved) heartbeat.
+            if (nextIndex[from] <= storage.snapshotIndex)
+                snapshotPending[from] = false;
             sendAppendTo(from);
         }
     }
