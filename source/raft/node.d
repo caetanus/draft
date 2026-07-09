@@ -132,6 +132,28 @@ struct RaftNode
         storage.saveSnapshot(upto, storage.termAt(upto), snapshotData);
     }
 
+    /// The lowest matchIndex across the other servers (0 if any follower has
+    /// replicated nothing). The host uses this to defer compaction while a
+    /// follower is still catching up within the retained log — compacting past
+    /// it would force it onto the snapshot path, which (for a required member of
+    /// a joint config) stalls commits until the snapshot lands. On a node with
+    /// no followers this is the commit index (nothing to wait for).
+    Index minFollowerMatch() nothrow
+    {
+        if (role_ != Role.leader)
+            return commitIndex_;
+        Index lo = commitIndex_;
+        bool any = false;
+        foreach (m; otherServers())
+        {
+            any = true;
+            auto mi = idxGet(matchIndex, m, 0);
+            if (mi < lo)
+                lo = mi;
+        }
+        return any ? lo : commitIndex_;
+    }
+
     void onPersisted(Index index) nothrow
     {
         if (index > persistedIndex_)

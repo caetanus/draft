@@ -135,4 +135,115 @@ version (unittest)
         (l != 0).expect.to.equal(true);
         c.converged().expect.to.equal(true);
     }
+
+    @("raft.chaos_membership_survives")
+    unittest
+    {
+        // A busy party: members join and leave randomly while traffic flows.
+        // Safety is asserted every step (so it holds DURING the churn); the
+        // liveness goal — every remaining member converges once the party ends
+        // — is asserted at the end.
+        auto c = new Cluster(3, 55);
+        c.electLeader().expect.to.equal(true);
+        ulong rng = 0xC0FFEE1234;
+        ulong rnd() nothrow
+        {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            return rng;
+        }
+
+        bool has(NodeId[] s, NodeId id) nothrow
+        {
+            foreach (m; s)
+                if (m == id)
+                    return true;
+            return false;
+        }
+
+        NodeId[] members = [1, 2, 3];
+        foreach (round; 0 .. 18)
+        {
+            foreach (i; 0 .. 15)
+                c.propose(pay("traffic"));
+            foreach (_; 0 .. 8)
+                c.step();
+
+            auto lead = c.leader();
+            if (lead == 0)
+            {
+                foreach (_; 0 .. 25)
+                    c.step();
+                continue;
+            }
+
+            const grow = (rnd() % 2 == 0) || members.length <= 3;
+            if (grow && members.length < 7)
+            {
+                auto id = cast(NodeId) c.addNode();
+                NodeId[] next = members ~ id;
+                if (c.changeMembership(next))
+                {
+                    // wait until the new node is a committed member on the leader
+                    foreach (_; 0 .. 80)
+                    {
+                        c.step();
+                        auto ll = c.leader();
+                        if (ll != 0 && memberOf(c, ll, id))
+                            break;
+                    }
+                    auto ll = c.leader();
+                    if (ll != 0 && memberOf(c, ll, id))
+                        members = next;
+                    else
+                        c.crash(id); // never got in — orphan leaves
+                }
+                else
+                    c.crash(id);
+            }
+            else if (members.length > 3)
+            {
+                NodeId victim = 0;
+                foreach (m; members)
+                    if (m != lead)
+                    {
+                        victim = m;
+                        break;
+                    }
+                if (victim != 0)
+                {
+                    NodeId[] next;
+                    foreach (m; members)
+                        if (m != victim)
+                            next ~= m;
+                    if (c.changeMembership(next))
+                    {
+                        // wait until the victim is out before it "leaves"
+                        foreach (_; 0 .. 80)
+                        {
+                            c.step();
+                            auto ll = c.leader();
+                            if (ll != 0 && !memberOf(c, ll, victim))
+                                break;
+                        }
+                        members = next;
+                        c.crash(victim);
+                    }
+                }
+            }
+            foreach (_; 0 .. 20)
+                c.step();
+        }
+
+        // party's over: any node not in the final membership leaves; quiesce.
+        foreach (id; 1 .. c.n + 1)
+            if (!has(members, cast(NodeId) id))
+                c.crash(cast(NodeId) id);
+        foreach (i; 0 .. 20)
+            c.propose(pay("last"));
+        foreach (_; 0 .. 250)
+            c.step();
+        c.converged().expect.to.equal(true);
+    }
 }
