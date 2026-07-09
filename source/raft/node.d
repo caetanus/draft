@@ -43,7 +43,6 @@ struct RaftNode
     private Index[NodeId] matchIndex;
     private bool[NodeId] voteFrom;
     private bool[NodeId] snapshotPending; // a snapshot is in flight to this follower
-    private bool[NodeId] appendInFlight; // an entry-carrying AppendEntries is in flight
     private Vec!RaftMessage outbox; // malloc-backed, reused each cycle (zero-GC)
     private Vec!RaftMessage readyMessages; // takeReady snapshot, isolated from later emits
     private Vec!NodeId otherScratch; // reused by otherServers(), consumed synchronously
@@ -206,15 +205,14 @@ struct RaftNode
                     fprintf(stderr, "[%lld] HB self=%u\n",
                             cast(long) MonoTime.currTime.ticks, self);
                 }
-                // Clear the in-flight snapshot/append flags so a follower still
-                // behind gets one retry this heartbeat (bounds a lost message to
-                // heartbeat rate; in-place update of existing keys, no GC).
+                // Clear the in-flight snapshot flag so a follower still behind
+                // gets one retry this heartbeat (bounds a lost snapshot to
+                // heartbeat rate). Lost appends self-heal via reject/backoff, so
+                // the pipeline window needs no per-heartbeat reset.
                 foreach (m; otherServers())
                 {
                     if (m in snapshotPending)
                         snapshotPending[m] = false;
-                    if (m in appendInFlight)
-                        appendInFlight[m] = false;
                 }
                 broadcastAppend();
             }
@@ -346,12 +344,16 @@ struct RaftNode
         }
         if (role_ != Role.leader || rpc.term != storage.currentTerm)
             return;
-        appendInFlight[from] = false; // this reply retires the in-flight append
         if (rpc.success)
         {
             if (rpc.matchIndex > idxGet(matchIndex, from, 0))
                 matchIndex[from] = rpc.matchIndex;
-            nextIndex[from] = matchIndex[from] + 1;
+            // Keep the optimistic advance: only pull nextIndex FORWARD to the
+            // confirmed point, never back (a pipelined ack must not rewind the
+            // in-flight window).
+            auto want = idxGet(matchIndex, from, 0) + 1;
+            if (idxGet(nextIndex, from, 1) < want)
+                nextIndex[from] = want;
             advanceCommit();
             if (nextIndex[from] <= storage.lastIndex)
                 sendAppendTo(from);
@@ -558,7 +560,6 @@ struct RaftNode
         nextIndex = null;
         matchIndex = null;
         snapshotPending = null;
-        appendInFlight = null;
         foreach (m; otherServers())
         {
             nextIndex[m] = storage.lastIndex + 1;
@@ -571,6 +572,10 @@ struct RaftNode
     // A big batch keeps one AppendEntries carrying many entries, so group
     // commit needs few round-trips even when a follower is far behind.
     private enum MAX_BATCH = 2048;
+    // Max unacked entries in flight per follower before we stop pipelining and
+    // wait for acks. Bounds the transport outbox for a slow follower; generous
+    // enough to keep a healthy follower's pipe full over a localhost RTT.
+    private enum MAX_INFLIGHT = MAX_BATCH * 16;
 
     private void sendAppendTo(NodeId to) nothrow
     {
@@ -588,22 +593,26 @@ struct RaftNode
             snapshotPending[to] = true;
             return;
         }
-        // Append pipeline depth 1: at most one entry-carrying AppendEntries in
-        // flight per follower. broadcastAppend runs on every batch flush, so
-        // without this a fast leader would pile up (and the transport would have
-        // to drop) redundant appends — starving a slow follower. Empty
-        // heartbeats (follower already current) always go, for liveness and to
-        // convey leaderCommit. The flag is cleared on the reply (which sends the
-        // next batch) and once per heartbeat (lost-message retry).
+        // Pipelined append: advance nextIndex OPTIMISTICALLY on send so the next
+        // flush ships the following batch without waiting for the ack — many
+        // AppendEntries in flight per follower (etcd-style), bounded by a window
+        // of unacked entries so a slow follower can't grow the outbox without
+        // bound. A lost message self-heals: the follower rejects the next
+        // (now-gap) append and the reject backs nextIndex up to resend. Empty
+        // heartbeats always go (liveness + leaderCommit).
         const hasEntries = ni <= storage.lastIndex;
-        if (hasEntries && boolGet(appendInFlight, to))
-            return;
-        auto prev = ni - 1;
-        auto rpc = AppendEntries(storage.currentTerm, self, prev,
-                prev > 0 ? storage.termAt(prev) : 0, commitIndex_, storage.entriesFrom(ni, MAX_BATCH));
-        emitAe(to, rpc);
         if (hasEntries)
-            appendInFlight[to] = true;
+        {
+            const inflight = ni - 1 - idxGet(matchIndex, to, 0); // unacked entries
+            if (inflight >= MAX_INFLIGHT)
+                return; // window full: wait for acks to advance matchIndex
+        }
+        auto prev = ni - 1;
+        auto batch = storage.entriesFrom(ni, MAX_BATCH);
+        emitAe(to, AppendEntries(storage.currentTerm, self, prev,
+                prev > 0 ? storage.termAt(prev) : 0, commitIndex_, batch));
+        if (hasEntries)
+            nextIndex[to] = ni + batch.length; // optimistic advance
     }
 
     void onInstallSnapshot(NodeId from, const ref InstallSnapshot rpc) nothrow

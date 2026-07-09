@@ -136,10 +136,9 @@ final class VibeTransport
         if (pp is null)
             return;
         auto st = *pp;
-        // The node throttles entry-carrying AppendEntries to one in flight per
-        // follower (raft.node appendInFlight), so the outbox no longer needs a
-        // drop-cap — a slow follower is never re-sent a redundant append until
-        // its reply (or a heartbeat) retires the in-flight one.
+        // The node bounds unacked entries per follower to a window (raft.node
+        // MAX_INFLIGHT, optimistic nextIndex), so the outbox can't grow without
+        // bound for a slow follower and needs no drop-cap here.
         st.outbox.put(framed);
         st.hasData.emit();
     }
@@ -155,6 +154,11 @@ final class VibeTransport
                 try
                 {
                     st.conn = connectTCP(st.addr.host, st.addr.port);
+                    // Raft is small request-response (AppendEntries -> reply);
+                    // Nagle + delayed-ACK stalls each round-trip ~40ms. Disable
+                    // it so replication acks flush immediately (the write path
+                    // throughput is gated by this round-trip, not fsync).
+                    st.conn.tcpNoDelay = true;
                     st.connected = true;
                 }
                 catch (Exception)
@@ -212,6 +216,7 @@ final class VibeTransport
         ByteVec buf; // malloc-backed reassembly buffer, reused across reads
         try
         {
+            conn.tcpNoDelay = true; // see connectLoop: kill Nagle on the ack path
             while (conn.connected)
             {
                 if (!conn.waitForData())
