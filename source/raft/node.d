@@ -438,17 +438,6 @@ struct RaftNode
             && (!activeConfig.joint || countMajority(activeConfig.cOld, &voted));
     }
 
-    private bool replicatedOn(Index n) nothrow
-    {
-        bool has(NodeId m) nothrow
-        {
-            return m == self ? persistedIndex_ >= n : idxGet(matchIndex, m, 0) >= n;
-        }
-
-        return countMajority(activeConfig.cNew, &has)
-            && (!activeConfig.joint || countMajority(activeConfig.cOld, &has));
-    }
-
     // --- internals ---
 
     private void broadcastAppend() nothrow
@@ -662,18 +651,53 @@ struct RaftNode
             sendAppendTo(from);
     }
 
+    // Highest index replicated on a majority of `members`: the majority-th
+    // largest matchIndex (self counts as persistedIndex_). O(members) via a tiny
+    // insertion sort — replaces scanning every uncommitted index with a
+    // per-member AA lookup (the old loop was O(uncommitted x members) hashed).
+    private Index majorityMatch(scope const(NodeId)[] members) nothrow
+    {
+        if (members.length == 0)
+            return commitIndex_; // an empty half of a config imposes no bound
+        Index[64] vals = void;
+        size_t n = 0;
+        foreach (m; members)
+        {
+            if (n >= vals.length)
+                break;
+            vals[n++] = m == self ? persistedIndex_ : idxGet(matchIndex, m, 0);
+        }
+        foreach (i; 1 .. n) // insertion sort, descending (n is tiny)
+        {
+            const v = vals[i];
+            size_t j = i;
+            while (j > 0 && vals[j - 1] < v)
+            {
+                vals[j] = vals[j - 1];
+                j--;
+            }
+            vals[j] = v;
+        }
+        // countMajority is a strict majority (c*2 > len), so the value a majority
+        // hold is the element at floor(n/2) in descending order.
+        return vals[n / 2];
+    }
     private void advanceCommit() nothrow
     {
-        auto last = storage.lastIndex;
-        for (auto n = last; n > commitIndex_; n--)
+        if (role_ == Role.leader)
         {
-            if (storage.termAt(n) != storage.currentTerm)
-                break;
-            if (replicatedOn(n))
+            Index cand = majorityMatch(activeConfig.cNew);
+            if (activeConfig.joint)
             {
-                commitIndex_ = n;
-                break;
+                const co = majorityMatch(activeConfig.cOld);
+                if (co < cand)
+                    cand = co; // both halves must agree during joint consensus
             }
+            // Raft §5.4.2: a leader commits by replication count only in its
+            // current term; log terms are non-decreasing, so if the majority
+            // index is an older term, no current-term entry is at majority yet.
+            if (cand > commitIndex_ && storage.termAt(cand) == storage.currentTerm)
+                commitIndex_ = cand;
         }
         // joint config committed -> append the final C_new
         if (role_ == Role.leader && activeConfig.joint && configEntryIndex != 0
