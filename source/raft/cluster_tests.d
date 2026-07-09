@@ -161,6 +161,82 @@ version (unittest)
         c.converged().expect.to.equal(true);
     }
 
+    @("raft.lagging_follower_catches_up_when_idle")
+    unittest
+    {
+        // A follower isolated during a large commit must catch up once healed,
+        // even with NO new proposals afterwards — only heartbeats drive the
+        // catch-up. Guards the batching failure mode (a follower left far
+        // behind that never converges).
+        auto c = new Cluster(5, 99);
+        c.electLeader().expect.to.equal(true);
+        auto l = c.leader();
+        NodeId f = l == 5 ? 4 : 5; // isolate a follower, never the leader
+        NodeId[] side;
+        foreach (id; 1 .. 6)
+            if (id != f)
+                side ~= cast(NodeId) id;
+        c.partition(side); // f cut off; leader + majority keep committing
+        c.electLeader(200).expect.to.equal(true);
+        foreach (i; 0 .. 200)
+            c.propose(pay("batch"));
+        foreach (_; 0 .. 200)
+            c.step();
+        // f is now far behind. Heal and go idle — heartbeats must catch it up.
+        c.heal();
+        foreach (_; 0 .. 500)
+            c.step();
+        c.converged().expect.to.equal(true);
+    }
+
+    @("raft.batched_propose_replicates_and_converges")
+    unittest
+    {
+        // Group commit: 100 entries appended locally then replicated with ONE
+        // flush must replicate and converge exactly like per-entry proposals.
+        auto c = new Cluster(5, 7);
+        c.electLeader().expect.to.equal(true);
+        const(ubyte)[][] batch;
+        foreach (i; 0 .. 100)
+            batch ~= pay("b");
+        c.proposeBatch(batch).expect.to.equal(100);
+        foreach (_; 0 .. 80)
+            c.step();
+        c.converged().expect.to.equal(true);
+        c.appliedCount.expect.to.equal(100);
+    }
+
+    @("raft.batched_propose_with_lagging_follower_converges")
+    unittest
+    {
+        // The live batching regression: a follower isolated during a batched
+        // commit must still catch up once healed (idle). Batched appends + the
+        // append-in-flight throttle must not strand it.
+        auto c = new Cluster(5, 21);
+        c.electLeader().expect.to.equal(true);
+        auto l = c.leader();
+        NodeId f = l == 5 ? 4 : 5;
+        NodeId[] side;
+        foreach (id; 1 .. 6)
+            if (id != f)
+                side ~= cast(NodeId) id;
+        c.partition(side);
+        c.electLeader(200).expect.to.equal(true);
+        foreach (round; 0 .. 5)
+        {
+            const(ubyte)[][] batch;
+            foreach (i; 0 .. 40)
+                batch ~= pay("x");
+            c.proposeBatch(batch);
+            foreach (_; 0 .. 20)
+                c.step();
+        }
+        c.heal();
+        foreach (_; 0 .. 500)
+            c.step();
+        c.converged().expect.to.equal(true);
+    }
+
     @("raft.old_term_entries_commit_via_noop")
     unittest
     {

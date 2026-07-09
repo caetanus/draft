@@ -43,6 +43,7 @@ struct RaftNode
     private Index[NodeId] matchIndex;
     private bool[NodeId] voteFrom;
     private bool[NodeId] snapshotPending; // a snapshot is in flight to this follower
+    private bool[NodeId] appendInFlight; // an entry-carrying AppendEntries is in flight
     private Vec!RaftMessage outbox; // malloc-backed, reused each cycle (zero-GC)
     private Vec!RaftMessage readyMessages; // takeReady snapshot, isolated from later emits
     private Vec!NodeId otherScratch; // reused by otherServers(), consumed synchronously
@@ -183,12 +184,16 @@ struct RaftNode
                     fprintf(stderr, "[%lld] HB self=%u\n",
                             cast(long) MonoTime.currTime.ticks, self);
                 }
-                // Clear in-flight snapshot flags so a follower still behind the
-                // snapshot gets one retry this heartbeat (bounds a lost snapshot
-                // to heartbeat rate; in-place update of existing keys, no GC).
+                // Clear the in-flight snapshot/append flags so a follower still
+                // behind gets one retry this heartbeat (bounds a lost message to
+                // heartbeat rate; in-place update of existing keys, no GC).
                 foreach (m; otherServers())
+                {
                     if (m in snapshotPending)
                         snapshotPending[m] = false;
+                    if (m in appendInFlight)
+                        appendInFlight[m] = false;
+                }
                 broadcastAppend();
             }
             return;
@@ -200,11 +205,28 @@ struct RaftNode
 
     Index propose(scope const(ubyte)[] payload) nothrow
     {
+        auto idx = proposeLocal(payload);
+        if (idx != 0)
+            broadcastAppend();
+        return idx;
+    }
+
+    /// Append a command to the local log WITHOUT broadcasting. Lets the host
+    /// batch many concurrent proposals under one lock, then replicate them all
+    /// with a single flush() (broadcast) + one durability fsync — group commit
+    /// for the Raft log. Returns 0 if not leader.
+    Index proposeLocal(scope const(ubyte)[] payload) nothrow
+    {
         if (role_ != Role.leader)
             return 0;
-        auto idx = appendLog(storage.currentTerm, payload);
-        broadcastAppend();
-        return idx;
+        return appendLog(storage.currentTerm, payload);
+    }
+
+    /// Replicate all locally-appended-but-unsent entries to the followers.
+    void flush() nothrow
+    {
+        if (role_ == Role.leader)
+            broadcastAppend();
     }
 
     // --- RPC ingress ---
@@ -302,6 +324,7 @@ struct RaftNode
         }
         if (role_ != Role.leader || rpc.term != storage.currentTerm)
             return;
+        appendInFlight[from] = false; // this reply retires the in-flight append
         if (rpc.success)
         {
             if (rpc.matchIndex > idxGet(matchIndex, from, 0))
@@ -506,6 +529,7 @@ struct RaftNode
         nextIndex = null;
         matchIndex = null;
         snapshotPending = null;
+        appendInFlight = null;
         foreach (m; otherServers())
         {
             nextIndex[m] = storage.lastIndex + 1;
@@ -515,9 +539,12 @@ struct RaftNode
         broadcastAppend();
     }
 
+    // A big batch keeps one AppendEntries carrying many entries, so group
+    // commit needs few round-trips even when a follower is far behind.
+    private enum MAX_BATCH = 2048;
+
     private void sendAppendTo(NodeId to) nothrow
     {
-        enum MAX_BATCH = 64;
         auto ni = idxGet(nextIndex, to, storage.lastIndex + 1);
         // the entries this follower needs were compacted away -> ship a snapshot,
         // but at most one in flight: broadcastAppend runs on every write, and
@@ -532,10 +559,22 @@ struct RaftNode
             snapshotPending[to] = true;
             return;
         }
+        // Append pipeline depth 1: at most one entry-carrying AppendEntries in
+        // flight per follower. broadcastAppend runs on every batch flush, so
+        // without this a fast leader would pile up (and the transport would have
+        // to drop) redundant appends — starving a slow follower. Empty
+        // heartbeats (follower already current) always go, for liveness and to
+        // convey leaderCommit. The flag is cleared on the reply (which sends the
+        // next batch) and once per heartbeat (lost-message retry).
+        const hasEntries = ni <= storage.lastIndex;
+        if (hasEntries && boolGet(appendInFlight, to))
+            return;
         auto prev = ni - 1;
         auto rpc = AppendEntries(storage.currentTerm, self, prev,
                 prev > 0 ? storage.termAt(prev) : 0, commitIndex_, storage.entriesFrom(ni, MAX_BATCH));
         emitAe(to, rpc);
+        if (hasEntries)
+            appendInFlight[to] = true;
     }
 
     void onInstallSnapshot(NodeId from, const ref InstallSnapshot rpc) nothrow

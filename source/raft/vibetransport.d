@@ -136,14 +136,10 @@ final class VibeTransport
         if (pp is null)
             return;
         auto st = *pp;
-        // Bound the queue: broadcastAppend runs on every write, so a producer
-        // faster than the writer drains would balloon the outbox with a backlog
-        // of largely-redundant appends (each re-carries overlapping entries),
-        // and automem keeps that peak capacity. Drop when over the cap — Raft
-        // recovers via the next heartbeat/ack with the correct nextIndex.
-        enum OUTBOX_CAP = 8 * 1024 * 1024;
-        if (st.outbox.length >= OUTBOX_CAP)
-            return;
+        // The node throttles entry-carrying AppendEntries to one in flight per
+        // follower (raft.node appendInFlight), so the outbox no longer needs a
+        // drop-cap — a slow follower is never re-sent a redundant append until
+        // its reply (or a heartbeat) retires the in-flight one.
         st.outbox.put(framed);
         st.hasData.emit();
     }

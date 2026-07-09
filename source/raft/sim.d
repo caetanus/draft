@@ -362,6 +362,22 @@ final class Cluster
         return l == 0 ? 0 : nodes[l - 1].propose(payload);
     }
 
+    /// Group-commit path: append many entries to the leader's log locally
+    /// (no per-entry broadcast), then replicate them all with a single flush.
+    /// Returns the number appended.
+    size_t proposeBatch(scope const(ubyte)[][] payloads) nothrow
+    {
+        auto l = leader();
+        if (l == 0)
+            return 0;
+        size_t appended = 0;
+        foreach (p; payloads)
+            if (nodes[l - 1].proposeLocal(p) != 0)
+                appended++;
+        nodes[l - 1].flush();
+        return appended;
+    }
+
     // --- invariants ---
 
     private @property size_t[] appliedPositions() nothrow
