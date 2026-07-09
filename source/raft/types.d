@@ -31,6 +31,20 @@ auto data(E)(ref return scope Vector!(E, Mallocator) v) @nogc nothrow @system
     return v[];
 }
 
+/// Bulk append: grow the length once, then memcpy. automem's Vector.put appends
+/// element-by-element with a bounds-checked toSizeT PER byte (even for a slice),
+/// which dominated the raft encode/outbox hot path; this is a single memcpy.
+void appendBytes(ref ByteVec v, scope const(ubyte)[] b) @nogc nothrow @system
+{
+    import core.stdc.string : memcpy;
+
+    if (b.length == 0)
+        return;
+    const at = v.length;
+    v.length = at + b.length; // reuse keeps capacity, so no realloc after warmup
+    memcpy(v[].ptr + at, b.ptr, b.length);
+}
+
 /// Overwrite 4 little-endian bytes at `at` (back-patches a frame length).
 /// Indexes the contiguous slice (automem's opIndex isn't nothrow; slice
 /// indexing only raises Error, which nothrow permits).

@@ -139,7 +139,7 @@ final class VibeTransport
         // The node bounds unacked entries per follower to a window (raft.node
         // MAX_INFLIGHT, optimistic nextIndex), so the outbox can't grow without
         // bound for a slow follower and needs no drop-cap here.
-        st.outbox.put(framed);
+        appendBytes(st.outbox, framed);
         st.hasData.emit();
     }
 
@@ -225,7 +225,7 @@ final class VibeTransport
                 auto n = conn.read(chunk[], IOMode.once);
                 if (n == 0)
                     break;
-                buf.put(chunk[0 .. n]);
+                appendBytes(buf, chunk[0 .. n]);
                 consumeFrames(buf);
             }
         }

@@ -19,21 +19,28 @@ enum MsgKind : ubyte
 
 // --- little-endian primitives (write into a malloc-backed ByteVec) ---
 
+// putU*/appendBytes use the memcpy-based bulk append from raft.types instead of
+// automem's per-byte Vector.put (which looped with a bounds-checked toSizeT per
+// byte — ~22% of encode CPU).
 private void putU8(ref ByteVec o, ubyte v) @nogc nothrow
 {
-    o.put(v);
+    appendBytes(o, (&v)[0 .. 1]);
 }
 
 private void putU32(ref ByteVec o, uint v) @nogc nothrow
 {
+    ubyte[4] b = void;
     foreach (i; 0 .. 4)
-        o.put(cast(ubyte)(v >> (8 * i)));
+        b[i] = cast(ubyte)(v >> (8 * i));
+    appendBytes(o, b[]);
 }
 
 private void putU64(ref ByteVec o, ulong v) @nogc nothrow
 {
+    ubyte[8] b = void;
     foreach (i; 0 .. 8)
-        o.put(cast(ubyte)(v >> (8 * i)));
+        b[i] = cast(ubyte)(v >> (8 * i));
+    appendBytes(o, b[]);
 }
 
 private struct Reader
@@ -151,7 +158,7 @@ const(ubyte)[] encodeAppendEntries(NodeId sender, const ref AppendEntries m) @no
             putU64(o, e.term);
             putU64(o, e.index);
             putU32(o, cast(uint) e.payload.length);
-            o.put(e.payload);
+            appendBytes(o, e.payload);
         }
     });
 }
@@ -173,7 +180,7 @@ const(ubyte)[] encodeInstallSnapshot(NodeId sender, const ref InstallSnapshot m)
         putU64(o, m.lastIncludedIndex);
         putU64(o, m.lastIncludedTerm);
         putU32(o, cast(uint) m.data.length);
-        o.put(m.data);
+        appendBytes(o, m.data);
     });
 }
 
