@@ -17,6 +17,8 @@
 			"preBuildCommands": [
 				"$DUB run --compiler=$$DC unit-threaded -c gen_ut_main -- -f bin/ut.d -d $DUB"
 			],
+			"comment": "unitUnthreaded: the deterministic sim is GC-heavy; running it single-threaded avoids a parallel GC-allocation-pressure crash in the test runner (not a raft or production issue). Override with -- --threads=N.",
+			"versions": ["unitUnthreaded"],
 			"targetName": "raft_tests",
 			"targetType": "executable"
 		}
