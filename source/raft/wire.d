@@ -17,23 +17,23 @@ enum MsgKind : ubyte
     installSnapshotReply = 6
 }
 
-// --- little-endian primitives ---
+// --- little-endian primitives (write into a malloc-backed ByteVec) ---
 
-private void putU8(ref ubyte[] o, ubyte v) nothrow
+private void putU8(ref ByteVec o, ubyte v) @nogc nothrow
 {
-    o ~= v;
+    o.put(v);
 }
 
-private void putU32(ref ubyte[] o, uint v) nothrow
+private void putU32(ref ByteVec o, uint v) @nogc nothrow
 {
     foreach (i; 0 .. 4)
-        o ~= cast(ubyte)(v >> (8 * i));
+        o.put(cast(ubyte)(v >> (8 * i)));
 }
 
-private void putU64(ref ubyte[] o, ulong v) nothrow
+private void putU64(ref ByteVec o, ulong v) @nogc nothrow
 {
     foreach (i; 0 .. 8)
-        o ~= cast(ubyte)(v >> (8 * i));
+        o.put(cast(ubyte)(v >> (8 * i)));
 }
 
 private struct Reader
@@ -42,7 +42,7 @@ private struct Reader
     size_t i;
     bool ok = true;
 
-    ubyte u8() nothrow
+    ubyte u8() @nogc nothrow
     {
         if (i + 1 > b.length)
         {
@@ -52,7 +52,7 @@ private struct Reader
         return b[i++];
     }
 
-    uint u32() nothrow
+    uint u32() @nogc nothrow
     {
         if (i + 4 > b.length)
         {
@@ -65,7 +65,7 @@ private struct Reader
         return v;
     }
 
-    ulong u64() nothrow
+    ulong u64() @nogc nothrow
     {
         if (i + 8 > b.length)
         {
@@ -78,7 +78,7 @@ private struct Reader
         return v;
     }
 
-    const(ubyte)[] bytes(size_t n) nothrow
+    const(ubyte)[] bytes(size_t n) @nogc nothrow
     {
         if (i + n > b.length)
         {
@@ -96,19 +96,30 @@ private struct Reader
 // their body) can still be attributed; for requests it equals candidateId/
 // leaderId.
 
-private ubyte[] frame(NodeId sender, MsgKind kind, scope void delegate(ref ubyte[]) nothrow body_) nothrow
+// A single reused, malloc-backed scratch buffer: the server runs with the GC
+// DISABLED (app.d), so a fresh `ubyte[]` per encode would never be reclaimed
+// and the leader OOM-crashes under sustained replication. ByteVec.clear()
+// keeps the capacity, so after warmup an encode allocates nothing. The
+// returned slice is valid until the next frame() call; send() copies it into
+// the peer outbox synchronously (no yield in between), so reuse is safe.
+// Thread-local: the event loop is single-threaded.
+private ByteVec frameScratch;
+
+private const(ubyte)[] frame(NodeId sender, MsgKind kind,
+        scope void delegate(ref ByteVec) @nogc nothrow body_) @nogc nothrow
 {
-    ubyte[] payload;
-    putU32(payload, sender);
-    putU8(payload, kind);
-    body_(payload);
-    ubyte[] out_;
-    putU32(out_, cast(uint) payload.length);
-    out_ ~= payload;
-    return out_;
+    frameScratch.clear();
+    putU32(frameScratch, 0); // length placeholder, back-patched below
+    putU32(frameScratch, sender);
+    putU8(frameScratch, kind);
+    body_(frameScratch);
+    // frame = [u32 len][u32 sender][u8 kind][fields]; len covers everything
+    // after the prefix (sender + kind + fields).
+    frameScratch.patchU32(0, cast(uint)(frameScratch.length - 4));
+    return frameScratch.data;
 }
 
-ubyte[] encodeRequestVote(NodeId sender, const ref RequestVote m) nothrow
+const(ubyte)[] encodeRequestVote(NodeId sender, const ref RequestVote m) @nogc nothrow
 {
     return frame(sender, MsgKind.requestVote, (ref o) {
         putU64(o, m.term);
@@ -118,7 +129,7 @@ ubyte[] encodeRequestVote(NodeId sender, const ref RequestVote m) nothrow
     });
 }
 
-ubyte[] encodeRequestVoteReply(NodeId sender, const ref RequestVoteReply m) nothrow
+const(ubyte)[] encodeRequestVoteReply(NodeId sender, const ref RequestVoteReply m) @nogc nothrow
 {
     return frame(sender, MsgKind.requestVoteReply, (ref o) {
         putU64(o, m.term);
@@ -126,7 +137,7 @@ ubyte[] encodeRequestVoteReply(NodeId sender, const ref RequestVoteReply m) noth
     });
 }
 
-ubyte[] encodeAppendEntries(NodeId sender, const ref AppendEntries m) nothrow
+const(ubyte)[] encodeAppendEntries(NodeId sender, const ref AppendEntries m) @nogc nothrow
 {
     return frame(sender, MsgKind.appendEntries, (ref o) {
         putU64(o, m.term);
@@ -140,12 +151,12 @@ ubyte[] encodeAppendEntries(NodeId sender, const ref AppendEntries m) nothrow
             putU64(o, e.term);
             putU64(o, e.index);
             putU32(o, cast(uint) e.payload.length);
-            o ~= e.payload;
+            o.put(e.payload);
         }
     });
 }
 
-ubyte[] encodeAppendEntriesReply(NodeId sender, const ref AppendEntriesReply m) nothrow
+const(ubyte)[] encodeAppendEntriesReply(NodeId sender, const ref AppendEntriesReply m) @nogc nothrow
 {
     return frame(sender, MsgKind.appendEntriesReply, (ref o) {
         putU64(o, m.term);
@@ -154,7 +165,7 @@ ubyte[] encodeAppendEntriesReply(NodeId sender, const ref AppendEntriesReply m) 
     });
 }
 
-ubyte[] encodeInstallSnapshot(NodeId sender, const ref InstallSnapshot m) nothrow
+const(ubyte)[] encodeInstallSnapshot(NodeId sender, const ref InstallSnapshot m) @nogc nothrow
 {
     return frame(sender, MsgKind.installSnapshot, (ref o) {
         putU64(o, m.term);
@@ -162,11 +173,11 @@ ubyte[] encodeInstallSnapshot(NodeId sender, const ref InstallSnapshot m) nothro
         putU64(o, m.lastIncludedIndex);
         putU64(o, m.lastIncludedTerm);
         putU32(o, cast(uint) m.data.length);
-        o ~= m.data;
+        o.put(m.data);
     });
 }
 
-ubyte[] encodeInstallSnapshotReply(NodeId sender, const ref InstallSnapshotReply m) nothrow
+const(ubyte)[] encodeInstallSnapshotReply(NodeId sender, const ref InstallSnapshotReply m) @nogc nothrow
 {
     return frame(sender, MsgKind.installSnapshotReply, (ref o) {
         putU64(o, m.term);
@@ -189,7 +200,7 @@ bool decodeInstallSnapshot(scope const(ubyte)[] body_, out InstallSnapshot m) no
     return r.ok;
 }
 
-bool decodeInstallSnapshotReply(scope const(ubyte)[] body_, out InstallSnapshotReply m) nothrow
+bool decodeInstallSnapshotReply(scope const(ubyte)[] body_, out InstallSnapshotReply m) @nogc nothrow
 {
     auto r = Reader(body_);
     r.u8();
@@ -200,7 +211,7 @@ bool decodeInstallSnapshotReply(scope const(ubyte)[] body_, out InstallSnapshotR
 
 /// Reads the sender id from a frame body ([u32 sender][kind][fields]) and
 /// returns the raft-wire body ([kind][fields]) for the decode functions.
-const(ubyte)[] splitSender(scope return const(ubyte)[] frameBody, out NodeId sender, out bool ok) nothrow
+const(ubyte)[] splitSender(scope return const(ubyte)[] frameBody, out NodeId sender, out bool ok) @nogc nothrow
 {
     if (frameBody.length < 5)
     {
@@ -215,7 +226,7 @@ const(ubyte)[] splitSender(scope return const(ubyte)[] frameBody, out NodeId sen
 
 // --- decode: `body` is the post-sender payload ([kind][fields]) ---
 
-MsgKind peekKind(scope const(ubyte)[] body_, out bool ok) nothrow
+MsgKind peekKind(scope const(ubyte)[] body_, out bool ok) @nogc nothrow
 {
     if (body_.length == 0)
     {
@@ -226,7 +237,7 @@ MsgKind peekKind(scope const(ubyte)[] body_, out bool ok) nothrow
     return cast(MsgKind) body_[0];
 }
 
-bool decodeRequestVote(scope const(ubyte)[] body_, out RequestVote m) nothrow
+bool decodeRequestVote(scope const(ubyte)[] body_, out RequestVote m) @nogc nothrow
 {
     auto r = Reader(body_);
     r.u8(); // kind
@@ -237,7 +248,7 @@ bool decodeRequestVote(scope const(ubyte)[] body_, out RequestVote m) nothrow
     return r.ok;
 }
 
-bool decodeRequestVoteReply(scope const(ubyte)[] body_, out RequestVoteReply m) nothrow
+bool decodeRequestVoteReply(scope const(ubyte)[] body_, out RequestVoteReply m) @nogc nothrow
 {
     auto r = Reader(body_);
     r.u8();
@@ -246,8 +257,14 @@ bool decodeRequestVoteReply(scope const(ubyte)[] body_, out RequestVoteReply m) 
     return r.ok;
 }
 
-/// Decoded entries' payloads are freshly allocated (owned by the caller).
-bool decodeAppendEntries(scope const(ubyte)[] body_, out AppendEntries m) nothrow
+// Decoded entries live in this reused, malloc-backed vector; their payloads
+// are SLICES into the caller's frame buffer (no copy). Valid only until the
+// next decodeAppendEntries call — safe because the transport dispatches one
+// frame at a time and the node copies payloads into its log (mallocDup)
+// synchronously within that dispatch, before the buffer is reused. Thread-local.
+private Vec!LogEntry decodeEntries;
+
+bool decodeAppendEntries(scope const(ubyte)[] body_, out AppendEntries m) @nogc nothrow
 {
     auto r = Reader(body_);
     r.u8();
@@ -259,21 +276,23 @@ bool decodeAppendEntries(scope const(ubyte)[] body_, out AppendEntries m) nothro
     auto n = r.u32();
     if (!r.ok || n > 1_000_000)
         return false;
-    auto entries = new LogEntry[n];
+    decodeEntries.clear();
     foreach (k; 0 .. n)
     {
-        entries[k].term = r.u64();
-        entries[k].index = r.u64();
+        LogEntry e;
+        e.term = r.u64();
+        e.index = r.u64();
         auto plen = r.u32();
-        entries[k].payload = r.bytes(plen).dup;
+        e.payload = r.bytes(plen); // slice into body_, not a copy
         if (!r.ok)
             return false;
+        decodeEntries.put(e);
     }
-    m.entries = entries;
+    m.entries = decodeEntries.data;
     return true;
 }
 
-bool decodeAppendEntriesReply(scope const(ubyte)[] body_, out AppendEntriesReply m) nothrow
+bool decodeAppendEntriesReply(scope const(ubyte)[] body_, out AppendEntriesReply m) @nogc nothrow
 {
     auto r = Reader(body_);
     r.u8();

@@ -8,6 +8,39 @@ alias Term = ulong;
 alias Index = ulong; // 1-based; 0 means "none"
 alias NodeId = uint;
 
+// ---------------------------------------------------------------------------
+// Zero-GC building blocks. The server runs with the GC disabled (the data
+// plane is malloc/arena), so the Raft hot path must not touch the GC heap.
+// These are automem malloc-backed vectors (Mallocator ⇒ @nogc, RAII free);
+// reused across cycles (clear() keeps capacity) so steady state allocates
+// nothing. `put`/`popBack`/`clear`/`length`/`opSlice` are automem's own; the
+// two UFCS helpers below (`data`, `patchU32`) round out the small API the
+// codec/node use.
+// ---------------------------------------------------------------------------
+
+import std.experimental.allocator.mallocator : Mallocator;
+
+public import automem.vector : Vector;
+
+alias ByteVec = Vector!(ubyte, Mallocator);
+alias Vec(T) = Vector!(T, Mallocator);
+
+/// The underlying contiguous slice (automem opSlice is @system).
+auto data(E)(ref return scope Vector!(E, Mallocator) v) @nogc nothrow @system
+{
+    return v[];
+}
+
+/// Overwrite 4 little-endian bytes at `at` (back-patches a frame length).
+/// Indexes the contiguous slice (automem's opIndex isn't nothrow; slice
+/// indexing only raises Error, which nothrow permits).
+void patchU32(ref ByteVec v, size_t at, uint value) @nogc nothrow @system
+{
+    auto s = v[];
+    foreach (i; 0 .. 4)
+        s[at + i] = cast(ubyte)(value >> (8 * i));
+}
+
 enum Role : ubyte
 {
     follower,

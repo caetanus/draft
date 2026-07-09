@@ -42,7 +42,10 @@ struct RaftNode
     private Index[NodeId] nextIndex;
     private Index[NodeId] matchIndex;
     private bool[NodeId] voteFrom;
-    private RaftMessage[] outbox;
+    private bool[NodeId] snapshotPending; // a snapshot is in flight to this follower
+    private Vec!RaftMessage outbox; // malloc-backed, reused each cycle (zero-GC)
+    private Vec!RaftMessage readyMessages; // takeReady snapshot, isolated from later emits
+    private Vec!NodeId otherScratch; // reused by otherServers(), consumed synchronously
     private SnapshotToApply* pendingSnapshot; // set when a leader's snapshot must be loaded
 
     // membership
@@ -96,13 +99,24 @@ struct RaftNode
 
     // --- Ready pattern host interface ---
 
+    // Snapshots the pending outbox into `readyMessages` and clears the outbox,
+    // so messages emitted DURING onPersisted (e.g. advanceCommit's joint->final
+    // config broadcast) accumulate cleanly for the next cycle instead of
+    // corrupting this cycle's slice. `messages` is valid until the next
+    // takeReady on THIS node; the vibe host, where cycles overlap across the
+    // durability yield, copies it to a stack buffer under the node lock.
+    // NOTE: not @nogc only because it reads storage.lastIndex (the Storage
+    // interface does I/O); it performs no GC allocation (reused Vec buffers).
     Ready takeReady() nothrow
     {
+        readyMessages.clear();
+        foreach (ref m; outbox.data)
+            readyMessages.put(m);
+        outbox.clear();
         Ready rd;
-        rd.messages = outbox;
+        rd.messages = readyMessages.data;
         rd.persistUpto = storage.lastIndex;
         rd.applySnapshot = pendingSnapshot;
-        outbox = null;
         pendingSnapshot = null;
         return rd;
     }
@@ -161,6 +175,20 @@ struct RaftNode
             if (heartbeatCounter >= heartbeatTicks)
             {
                 heartbeatCounter = 0;
+                debug (raftelect)
+                {
+                    import core.stdc.stdio : fprintf, stderr;
+                    import core.time : MonoTime;
+
+                    fprintf(stderr, "[%lld] HB self=%u\n",
+                            cast(long) MonoTime.currTime.ticks, self);
+                }
+                // Clear in-flight snapshot flags so a follower still behind the
+                // snapshot gets one retry this heartbeat (bounds a lost snapshot
+                // to heartbeat rate; in-place update of existing keys, no GC).
+                foreach (m; otherServers())
+                    if (m in snapshotPending)
+                        snapshotPending[m] = false;
                 broadcastAppend();
             }
             return;
@@ -375,16 +403,19 @@ struct RaftNode
             sendAppendTo(m);
     }
 
-    private NodeId[] otherServers() nothrow
+    // Fills and returns the reused otherScratch buffer (zero-GC). The slice is
+    // valid until the next otherServers() call; both callers (broadcastAppend,
+    // becomeLeader) iterate it immediately and synchronously.
+    private const(NodeId)[] otherServers() @nogc nothrow
     {
-        NodeId[] out_;
+        otherScratch.clear();
         foreach (m; activeConfig.cNew)
             if (m != self)
-                out_ ~= m;
+                otherScratch.put(m);
         foreach (m; activeConfig.cOld)
-            if (m != self && !contains(out_, m))
-                out_ ~= m;
-        return out_;
+            if (m != self && !contains(otherScratch.data, m))
+                otherScratch.put(m);
+        return otherScratch.data;
     }
 
 
@@ -400,7 +431,7 @@ struct RaftNode
         return p ? *p : false;
     }
 
-    private static bool contains(scope const(NodeId)[] s, NodeId id) nothrow
+    private static bool contains(scope const(NodeId)[] s, NodeId id) @nogc nothrow
     {
         foreach (x; s)
             if (x == id)
@@ -436,6 +467,15 @@ struct RaftNode
         // a server removed from the configuration stops trying to lead
         if (!activeConfig.contains(self))
             return;
+        debug (raftelect)
+        {
+            import core.stdc.stdio : fprintf, stderr;
+            import core.time : MonoTime;
+
+            fprintf(stderr, "[%lld] ELECTION self=%u sinceHeard=%u deadline=%u term->%llu\n",
+                    cast(long) MonoTime.currTime.ticks, self, sinceHeard, electionDeadline,
+                    cast(ulong)(storage.currentTerm + 1));
+        }
         storage.setCurrentTerm(storage.currentTerm + 1);
         storage.setVotedFor(self);
         role_ = Role.candidate;
@@ -465,6 +505,7 @@ struct RaftNode
         heartbeatCounter = 0;
         nextIndex = null;
         matchIndex = null;
+        snapshotPending = null;
         foreach (m; otherServers())
         {
             nextIndex[m] = storage.lastIndex + 1;
@@ -478,11 +519,17 @@ struct RaftNode
     {
         enum MAX_BATCH = 64;
         auto ni = idxGet(nextIndex, to, storage.lastIndex + 1);
-        // the entries this follower needs were compacted away -> ship a snapshot
+        // the entries this follower needs were compacted away -> ship a snapshot,
+        // but at most one in flight: broadcastAppend runs on every write, and
+        // re-shipping the full (growing) snapshot each time explodes memory. The
+        // flag is cleared on the reply and once per heartbeat (lost-snapshot retry).
         if (ni <= storage.snapshotIndex)
         {
+            if (boolGet(snapshotPending, to))
+                return;
             emitIs(to, InstallSnapshot(storage.currentTerm, self, storage.snapshotIndex,
                     storage.snapshotTerm, storage.snapshotData));
+            snapshotPending[to] = true;
             return;
         }
         auto prev = ni - 1;
@@ -532,6 +579,7 @@ struct RaftNode
         if (rpc.lastIncludedIndex > idxGet(matchIndex, from, 0))
             matchIndex[from] = rpc.lastIncludedIndex;
         nextIndex[from] = idxGet(matchIndex, from, 0) + 1;
+        snapshotPending[from] = false; // snapshot delivered; resume normal append
         advanceCommit();
         if (idxGet(nextIndex, from, 1) <= storage.lastIndex)
             sendAppendTo(from);
@@ -571,39 +619,39 @@ struct RaftNode
 
     // --- message emission ---
 
-    private void emitRv(NodeId to, RequestVote m) nothrow
+    private void emitRv(NodeId to, RequestVote m) @nogc nothrow
     {
         RaftMessage msg = {to: to, type: MessageType.requestVote, rv: m};
-        outbox ~= msg;
+        outbox.put(msg);
     }
 
-    private void emitRvr(NodeId to, RequestVoteReply m) nothrow
+    private void emitRvr(NodeId to, RequestVoteReply m) @nogc nothrow
     {
         RaftMessage msg = {to: to, type: MessageType.requestVoteReply, rvr: m};
-        outbox ~= msg;
+        outbox.put(msg);
     }
 
-    private void emitAe(NodeId to, AppendEntries m) nothrow
+    private void emitAe(NodeId to, AppendEntries m) @nogc nothrow
     {
         RaftMessage msg = {to: to, type: MessageType.appendEntries, ae: m};
-        outbox ~= msg;
+        outbox.put(msg);
     }
 
-    private void emitAer(NodeId to, AppendEntriesReply m) nothrow
+    private void emitAer(NodeId to, AppendEntriesReply m) @nogc nothrow
     {
         RaftMessage msg = {to: to, type: MessageType.appendEntriesReply, aer: m};
-        outbox ~= msg;
+        outbox.put(msg);
     }
 
-    private void emitIs(NodeId to, InstallSnapshot m) nothrow
+    private void emitIs(NodeId to, InstallSnapshot m) @nogc nothrow
     {
         RaftMessage msg = {to: to, type: MessageType.installSnapshot, is_: m};
-        outbox ~= msg;
+        outbox.put(msg);
     }
 
-    private void emitIsr(NodeId to, InstallSnapshotReply m) nothrow
+    private void emitIsr(NodeId to, InstallSnapshotReply m) @nogc nothrow
     {
         RaftMessage msg = {to: to, type: MessageType.installSnapshotReply, isr: m};
-        outbox ~= msg;
+        outbox.put(msg);
     }
 }

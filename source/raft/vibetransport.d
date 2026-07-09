@@ -8,10 +8,11 @@ module raft.vibetransport;
 // then gates replies on durability). Message loss on a dead connection is
 // fine: Raft retries via heartbeats and nextIndex backup.
 
+import core.stdc.string : memmove;
 import core.time : msecs;
 
 import vibe.core.core : runTask, sleep;
-import vibe.core.net : connectTCP, listenTCP, TCPConnection;
+import vibe.core.net : connectTCP, listenTCP, TCPConnection, TCPListenOptions;
 import vibe.core.stream : IOMode;
 import vibe.core.sync : createManualEvent, LocalManualEvent;
 
@@ -41,7 +42,8 @@ final class VibeTransport
         PeerAddress addr;
         TCPConnection conn;
         bool connected;
-        ubyte[] outbox;
+        ByteVec outbox; // accumulating; send() appends here (malloc-backed)
+        ByteVec sendbuf; // being written; ping-ponged with outbox, both reused
         LocalManualEvent hasData;
     }
 
@@ -83,7 +85,10 @@ final class VibeTransport
     void start(ushort listenPort)
     {
         running = true;
-        listenTCP(listenPort, (conn) @trusted nothrow { receiveLoop(conn); });
+        // SO_REUSEADDR + SO_REUSEPORT so a restarted node rebinds its raft
+        // port immediately instead of waiting out TIME_WAIT.
+        listenTCP(listenPort, (conn) @trusted nothrow { receiveLoop(conn); },
+                TCPListenOptions.reuseAddress | TCPListenOptions.reusePort);
         foreach (id, st; peerState)
         {
             auto peer = st;
@@ -100,7 +105,7 @@ final class VibeTransport
     /// Encode a node output and enqueue to its target (never yields).
     void send(const ref RaftMessage m) nothrow
     {
-        ubyte[] framed;
+        const(ubyte)[] framed;
         final switch (m.type)
         {
         case MessageType.requestVote:
@@ -131,7 +136,7 @@ final class VibeTransport
         if (pp is null)
             return;
         auto st = *pp;
-        st.outbox ~= framed;
+        st.outbox.put(framed);
         st.hasData.emit();
     }
 
@@ -173,10 +178,15 @@ final class VibeTransport
             auto ec = st.hasData.emitCount;
             if (st.outbox.length && st.connected)
             {
-                auto batch = st.outbox;
-                st.outbox = null;
+                // Ping-pong the two malloc buffers: send() refills the emptied
+                // one while we write the other. swap moves (no copy/alloc), so
+                // steady-state sending allocates nothing.
+                import std.algorithm.mutation : swap;
+
+                swap(st.outbox, st.sendbuf);
+                st.outbox.clear();
                 try
-                    st.conn.write(batch);
+                    st.conn.write(st.sendbuf[]);
                 catch (Exception)
                 {
                     st.connected = false; // drop: Raft retries
@@ -195,7 +205,7 @@ final class VibeTransport
 
     private void receiveLoop(TCPConnection conn) nothrow
     {
-        ubyte[] buf;
+        ByteVec buf; // malloc-backed reassembly buffer, reused across reads
         try
         {
             while (conn.connected)
@@ -206,7 +216,7 @@ final class VibeTransport
                 auto n = conn.read(chunk[], IOMode.once);
                 if (n == 0)
                     break;
-                buf ~= chunk[0 .. n];
+                buf.put(chunk[0 .. n]);
                 consumeFrames(buf);
             }
         }
@@ -220,22 +230,30 @@ final class VibeTransport
         }
     }
 
-    private void consumeFrames(ref ubyte[] buf) nothrow
+    private void consumeFrames(ref ByteVec buf) nothrow
     {
+        auto s = buf[]; // contiguous slice into the malloc buffer
+        const total = s.length;
         size_t pos = 0;
-        while (buf.length - pos >= 4)
+        while (total - pos >= 4)
         {
-            uint len = buf[pos] | (cast(uint) buf[pos + 1] << 8)
-                | (cast(uint) buf[pos + 2] << 16) | (cast(uint) buf[pos + 3] << 24);
+            uint len = s[pos] | (cast(uint) s[pos + 1] << 8)
+                | (cast(uint) s[pos + 2] << 16) | (cast(uint) s[pos + 3] << 24);
             if (len > 64 * 1024 * 1024)
                 break;
-            if (buf.length - pos - 4 < len)
+            if (total - pos - 4 < len)
                 break; // incomplete
-            dispatchFrame(buf[pos + 4 .. pos + 4 + len]);
+            dispatchFrame(s[pos + 4 .. pos + 4 + len]);
             pos += 4 + len;
         }
         if (pos > 0)
-            buf = buf[pos .. $];
+        {
+            // Compact the unconsumed tail to the front of the (reused) buffer.
+            size_t rem = total - pos;
+            if (rem > 0)
+                memmove(s.ptr, s.ptr + pos, rem);
+            buf.length = rem;
+        }
     }
 
     private void dispatchFrame(scope const(ubyte)[] frameBody) nothrow
