@@ -39,6 +39,8 @@ struct RaftNode
     private Index commitIndex_;
     private Index lastApplied;
     private Index persistedIndex_;
+    private Index truncatedFrom_; // set when a conflicting append truncates the
+    // log; surfaced once via takeReady() so the host can fail pending writes
     private Index[NodeId] nextIndex;
     private Index[NodeId] matchIndex;
     private bool[NodeId] voteFrom;
@@ -118,6 +120,8 @@ struct RaftNode
         rd.persistUpto = storage.lastIndex;
         rd.applySnapshot = pendingSnapshot;
         pendingSnapshot = null;
+        rd.truncatedFrom = truncatedFrom_;
+        truncatedFrom_ = 0;
         return rd;
     }
 
@@ -320,6 +324,8 @@ struct RaftNode
                 if (storage.termAt(e.index) == e.term)
                     continue;
                 storage.truncateFrom(e.index);
+                if (truncatedFrom_ == 0 || e.index < truncatedFrom_)
+                    truncatedFrom_ = e.index; // report so the host fails stale pending writes
                 if (persistedIndex_ >= e.index)
                     persistedIndex_ = e.index - 1;
                 refreshConfigFromLog(); // truncation may revert the config

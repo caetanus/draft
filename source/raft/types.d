@@ -164,6 +164,9 @@ struct Ready
     RaftMessage[] messages; // send only after persistUpto is durable
     Index persistUpto; // log is written up to here; host must make it durable
     SnapshotToApply* applySnapshot; // non-null: install this snapshot first
+    Index truncatedFrom; // >0: a conflicting append truncated the log from here,
+    // so any host bookkeeping keyed on those indices (pending client writes) is
+    // now stale — those entries will never commit
 }
 
 // --- membership changes (joint consensus, §6) ---
