@@ -200,13 +200,19 @@ bool isConfigEntry(scope const(ubyte)[] payload) nothrow @safe
     return payload.length >= CONFIG_TAG.length && payload[0 .. CONFIG_TAG.length] == CONFIG_TAG;
 }
 
-ubyte[] encodeConfig(const ref Configuration c) nothrow
+// Reused, malloc-backed (zero-GC). The payload is transient — the caller
+// appends it to the log, which copies it (mallocDup) — so a single reused
+// buffer is safe. Thread-local; config changes are serialized on the node.
+private ByteVec configScratch;
+
+const(ubyte)[] encodeConfig(const ref Configuration c) nothrow
 {
-    ubyte[] p = CONFIG_TAG.dup;
+    configScratch.clear();
+    configScratch.put(CONFIG_TAG);
     void u32(uint v)
     {
         foreach (i; 0 .. 4)
-            p ~= cast(ubyte)(v >> (8 * i));
+            configScratch.put(cast(ubyte)(v >> (8 * i)));
     }
 
     u32(cast(uint) c.cNew.length);
@@ -215,9 +221,16 @@ ubyte[] encodeConfig(const ref Configuration c) nothrow
     u32(cast(uint) c.cOld.length);
     foreach (id; c.cOld)
         u32(id);
-    return p;
+    return configScratch.data;
 }
 
+// NOTE: c.cNew/c.cOld are GC arrays retained in the active Configuration.
+// This is the one remaining GC allocation in the raft path, but it fires only
+// on a membership change or config recovery (both rare and bounded), never per
+// write or per message — so under GC.disable it is a microscopic bounded drip,
+// not a leak. Making Configuration malloc-owned would thread free() through a
+// value type copied across the node (changeMembership, refreshConfigFromLog),
+// which is far more bug-prone than the drip is worth.
 Configuration decodeConfig(scope const(ubyte)[] payload) nothrow
 {
     Configuration c;
