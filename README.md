@@ -1,12 +1,10 @@
-```
-       .-----. .-----.                  .-----.
-       |~~~~~|✦|~~~~~|                  |~~~~~|
-       | ° ° | | ° ° |                  | ° ° |
-       | ° ° | | ° ° |                  | ° ° |
-       |_____| |_____|                  |_____|
-        the majority toasts              a follower waits
-           · quorum ·                    · still replicating ·
-```
+<p align="center">
+  <img src="logo.png" alt="draft — Raft consensus for D, served fresh" width="240">
+</p>
+
+<p align="center">
+  <em>two glasses toast — the majority reaches <b>quorum</b> · one still fills — a <b>follower</b> replicating</em>
+</p>
 
 # draft
 
