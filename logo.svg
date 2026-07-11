@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#20293a"/>
+      <stop offset="1" stop-color="#0e1520"/>
+    </linearGradient>
+    <linearGradient id="beer" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffd457"/>
+      <stop offset="0.55" stop-color="#f5a623"/>
+      <stop offset="1" stop-color="#d9760c"/>
+    </linearGradient>
+    <linearGradient id="beerlow" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffcf66" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#d9760c" stop-opacity="0.85"/>
+    </linearGradient>
+    <linearGradient id="glass" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.32"/>
+      <stop offset="0.28" stop-color="#ffffff" stop-opacity="0.05"/>
+      <stop offset="0.72" stop-color="#ffffff" stop-opacity="0.05"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.18"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fff2c2" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#fff2c2" stop-opacity="0"/>
+    </radialGradient>
+    <g id="glass-body">
+      <path d="M -36 -2 L 36 -2 L 26 148 Q 26 156 18 156 L -18 156 Q -26 156 -26 148 Z"
+            fill="url(#glass)" stroke="#ffffff" stroke-opacity="0.55" stroke-width="2.5"/>
+      <rect x="-30" y="6" width="6" height="140" rx="3" fill="#ffffff" fill-opacity="0.16"/>
+    </g>
+    <g id="foam">
+      <path d="M -39 4 Q -42 -15 -23 -13 Q -15 -25 -1 -16 Q 9 -26 21 -13 Q 42 -17 39 5
+               Q 22 15 1 11 Q -18 16 -39 4 Z" fill="#fdfbf4"/>
+      <circle cx="-16" cy="-6" r="4" fill="#ffffff"/>
+      <circle cx="10" cy="-9" r="3.4" fill="#ffffff"/>
+      <circle cx="26" cy="-2" r="3" fill="#eee7d6"/>
+    </g>
+  </defs>
+
+  <rect x="0" y="0" width="512" height="512" rx="104" fill="url(#bg)"/>
+  <rect x="6" y="6" width="500" height="500" rx="100" fill="none" stroke="#e7b64a" stroke-opacity="0.35" stroke-width="3"/>
+
+  <!-- follower: apart, still filling (beer level low) -->
+  <g transform="translate(364,150)">
+    <use href="#glass-body"/>
+    <path d="M -28 66 L 28 66 L 22 143 Q 22 150 15 150 L -15 150 Q -22 150 -22 143 Z" fill="url(#beerlow)"/>
+    <circle cx="-6" cy="98" r="2.6" fill="#fff6d8" fill-opacity="0.7"/>
+    <circle cx="8" cy="118" r="2" fill="#fff6d8" fill-opacity="0.6"/>
+    <use href="#foam" transform="translate(0,64) scale(0.98)" opacity="0.92"/>
+  </g>
+
+  <!-- quorum: two glasses clinking -->
+  <g transform="translate(144,150) rotate(7 0 156)">
+    <use href="#glass-body"/>
+    <path d="M -31 28 L 31 28 L 23 143 Q 23 150 16 150 L -16 150 Q -23 150 -23 143 Z" fill="url(#beer)"/>
+    <circle cx="-8" cy="66" r="2.8" fill="#fff6d8" fill-opacity="0.75"/>
+    <circle cx="9" cy="92" r="2.2" fill="#fff6d8" fill-opacity="0.6"/>
+    <circle cx="-3" cy="112" r="2" fill="#fff6d8" fill-opacity="0.55"/>
+    <use href="#foam"/>
+  </g>
+  <g transform="translate(226,150) rotate(-7 0 156)">
+    <use href="#glass-body"/>
+    <path d="M -31 28 L 31 28 L 23 143 Q 23 150 16 150 L -16 150 Q -23 150 -23 143 Z" fill="url(#beer)"/>
+    <circle cx="7" cy="66" r="2.8" fill="#fff6d8" fill-opacity="0.75"/>
+    <circle cx="-8" cy="92" r="2.2" fill="#fff6d8" fill-opacity="0.6"/>
+    <circle cx="4" cy="112" r="2" fill="#fff6d8" fill-opacity="0.55"/>
+    <use href="#foam"/>
+  </g>
+
+  <!-- clink spark between the toasting rims -->
+  <circle cx="185" cy="150" r="26" fill="url(#glow)"/>
+  <path d="M 185 128 L 190 145 L 207 150 L 190 155 L 185 172 L 180 155 L 163 150 L 180 145 Z"
+        fill="#fff4cf"/>
+
+  <!-- wordmark -->
+  <text x="256" y="446" text-anchor="middle" font-family="'DejaVu Sans','Verdana',sans-serif"
+        font-size="88" font-weight="700" fill="#f5efe1" letter-spacing="2">draft</text>
+  <text x="256" y="484" text-anchor="middle" font-family="'DejaVu Sans','Verdana',sans-serif"
+        font-size="23" font-weight="600" fill="#e7b64a" letter-spacing="7">RAFT &#183; ON TAP</text>
+</svg>

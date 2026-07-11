@@ -1,11 +1,11 @@
 ```
-     .-----.  .-----.               .-----.
-     |~~~~~|  |~~~~~|               |~~~~~|
-     | o o | ><  o o |             | o o |
-     | o o |  | o o |              | o o |
-     |_____|  |_____|              |_____|
-       the majority toasts          a follower waits
-                (consensus)          (still replicating)
+       .-----. .-----.                  .-----.
+       |~~~~~|✦|~~~~~|                  |~~~~~|
+       | ° ° | | ° ° |                  | ° ° |
+       | ° ° | | ° ° |                  | ° ° |
+       |_____| |_____|                  |_____|
+        the majority toasts              a follower waits
+           · quorum ·                    · still replicating ·
 ```
 
 # draft
