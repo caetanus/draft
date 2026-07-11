@@ -20,7 +20,7 @@ alias NodeId = uint;
 
 import std.experimental.allocator.mallocator : Mallocator;
 
-public import dnds.vector : Vector;
+public import emplace.vector : Vector;
 
 alias ByteVec = Vector!(ubyte, Mallocator);
 alias Vec(T) = Vector!(T, Mallocator);

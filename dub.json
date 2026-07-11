@@ -26,8 +26,8 @@
 	"copyright": "Copyright © 2026, Marcelo Aires Caetano",
 	"dependencies": {
 		"vibe-core": "~>2.8",
-		"dlang-non-gc-data-structures": {
-			"path": "../dlang-non-gc-data-structures"
+		"emplace": {
+			"path": "../emplace"
 		}
 	},
 	"description": "Raft consensus for D on vibe-core — zero-GC data plane, storage-agnostic. Built for dreads.",
