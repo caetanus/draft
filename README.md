@@ -1,12 +1,11 @@
 ```
-       ___________
-      | ° ° ° ° ° |___
-      |___________|   |
-      |           |   |
-      |  d r a f  |   |
-      |     t     |   |
-      |           |___|
-      |___________|
+     .-----.  .-----.               .-----.
+     |~~~~~|  |~~~~~|               |~~~~~|
+     | o o | ><  o o |             | o o |
+     | o o |  | o o |              | o o |
+     |_____|  |_____|              |_____|
+       the majority toasts          a follower waits
+                (consensus)          (still replicating)
 ```
 
 # draft
@@ -24,9 +23,11 @@ Section references throughout the code and this README (e.g. §5.4.2 the own-ter
 commit rule, §6 membership changes, §7 log compaction) point at that paper.
 
 There is no maintained Raft implementation in the D ecosystem, so this one is
-built from scratch — originally for
-[dreads](https://github.com/caetanus/dreads) (a GC-free Redis/Valkey-compatible
-database), but designed as a standalone library any D project can plug into.
+built from scratch. It was **originally developed for
+[dreads](https://github.com/caetanus/dreads)** — a GC-free Redis/Valkey-compatible
+database that needed consensus-replicated durability — and is extracted here as a
+standalone library any D project can plug into (the consensus core knows nothing
+about dreads: entries are opaque bytes).
 
 ## Design constraints
 
