@@ -1,4 +1,9 @@
-.dub
-/bin/
-*.a
+.dub/
 *.o
+*.a
+*.lib
+*.so
+raft_tests
+libraft.a
+bin/ut.d
+dub.selections.json

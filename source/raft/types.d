@@ -11,9 +11,9 @@ alias NodeId = uint;
 // ---------------------------------------------------------------------------
 // Zero-GC building blocks. The server runs with the GC disabled (the data
 // plane is malloc/arena), so the Raft hot path must not touch the GC heap.
-// These are automem malloc-backed vectors (Mallocator ⇒ @nogc, RAII free);
+// These are emplace malloc-backed vectors (Mallocator => @nogc, RAII free);
 // reused across cycles (clear() keeps capacity) so steady state allocates
-// nothing. `put`/`popBack`/`clear`/`length`/`opSlice` are automem's own; the
+// nothing. `put`/`popBack`/`clear`/`length`/`opSlice` are emplace's own; the
 // two UFCS helpers below (`data`, `patchU32`) round out the small API the
 // codec/node use.
 // ---------------------------------------------------------------------------
