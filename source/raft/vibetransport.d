@@ -29,6 +29,25 @@ struct PeerAddress
 /// The raft body ([kind][fields], sender already stripped) is handed here.
 alias MessageHandler = void delegate(NodeId from, MsgKind kind, scope const(ubyte)[] body_) nothrow;
 
+/// Optional wire compression, injected by the host so this library keeps no
+/// codec dependency of its own. `compress` writes the compressed bytes of `src`
+/// into `dst` and returns their length, or 0 to leave the frame uncompressed.
+/// `decompress` restores exactly `origLen` bytes into `dst`, or returns false
+/// on malformed input. dreads wires these to liblz4; both null = no compression.
+alias CompressFn = size_t function(scope const(ubyte)[] src, ref ByteVec dst) nothrow @system;
+alias DecompressFn = bool function(scope const(ubyte)[] src, size_t origLen, ref ByteVec dst) nothrow @system;
+
+// Frames below this body size are never compressed: LZ4 has a fixed overhead
+// and tiny frames (heartbeats, votes, replies) neither shrink nor matter to
+// bandwidth. Only sizeable AppendEntries/InstallSnapshot bodies — "the logs" —
+// cross it, so the send path for control traffic is byte-for-byte unchanged.
+private enum size_t COMPRESS_MIN = 256;
+// The high bit of the u32 length prefix flags a compressed frame. The length
+// itself is capped at 64 MiB (< 2^26) both here and in consumeFrames, so bit 31
+// is always free to carry the flag.
+private enum uint COMPRESSED_FLAG = 0x8000_0000u;
+private enum uint LENGTH_MASK = 0x7FFF_FFFFu;
+
 final class VibeTransport
 {
     private NodeId self;
@@ -36,6 +55,17 @@ final class VibeTransport
     private MessageHandler onMessage;
     private Peer[NodeId] peerState;
     private bool running;
+    // Optional compression (see CompressFn). compressFn gates the OUTBOUND path
+    // (null = send plaintext); decompressFn, when set, lets us READ compressed
+    // frames regardless — so a node with compression off still understands a
+    // leader that has it on (rolling config changes never wedge). Both scratch
+    // buffers are malloc-backed and reused (no per-frame alloc); the transport
+    // runs on a single thread, so instance-level scratch is race-free.
+    private CompressFn compressFn;
+    private DecompressFn decompressFn;
+    private ByteVec cbuf; // compress scratch (leader)
+    private ByteVec cframe; // framed compressed message (leader)
+    private ByteVec dbuf; // decompress scratch (follower)
 
     private static final class Peer
     {
@@ -63,6 +93,16 @@ final class VibeTransport
     void setHandler(MessageHandler h)
     {
         onMessage = h;
+    }
+
+    /// Install the optional wire codec. `compress` null => never compress
+    /// outbound; `decompress` non-null => understand compressed inbound frames.
+    /// dreads passes a decompressor always (so it can read a compressing peer)
+    /// and a compressor only when `raft-compress yes`.
+    void setCompression(CompressFn compress, DecompressFn decompress)
+    {
+        compressFn = compress;
+        decompressFn = decompress;
     }
 
     /// Adds a peer to a running transport (a node joining via membership
@@ -127,7 +167,33 @@ final class VibeTransport
             framed = encodeInstallSnapshotReply(self, m.isr);
             break;
         }
-        enqueue(m.to, framed);
+        enqueue(m.to, maybeCompress(framed));
+    }
+
+    // Leader side: compress a frame's body when it's worth it, else pass it
+    // through untouched. Input/return are both full frames ([u32 len][body]).
+    // A compressed frame is [u32 (4+clen)|FLAG][u32 origLen][clen bytes], where
+    // the body that decompresses back to the original [u32 sender][kind][fields]
+    // is `body` = framed[4..]. Never expands the wire: if LZ4 fails or doesn't
+    // save at least the 4-byte origLen header, the plaintext frame is sent.
+    private const(ubyte)[] maybeCompress(return scope const(ubyte)[] framed) nothrow @system
+    {
+        if (compressFn is null || framed.length < 4)
+            return framed;
+        auto body_ = framed[4 .. $];
+        if (body_.length < COMPRESS_MIN)
+            return framed;
+        immutable clen = compressFn(body_, cbuf);
+        // Require a real win over sending plaintext (clen + the 4-byte origLen
+        // field must beat the original body); also keep the flag bit free.
+        if (clen == 0 || clen + 4 >= body_.length || (4 + clen) > LENGTH_MASK)
+            return framed;
+        cframe.clear();
+        cframe.length = 8; // [u32 len|flag][u32 origLen], both patched below
+        cframe.patchU32(0, cast(uint)((4 + clen) | COMPRESSED_FLAG));
+        cframe.patchU32(4, cast(uint) body_.length); // origLen for the decoder
+        appendBytes(cframe, cbuf.data[0 .. clen]);
+        return cframe.data;
     }
 
     private void enqueue(NodeId to, scope const(ubyte)[] framed) nothrow
@@ -246,13 +312,19 @@ final class VibeTransport
         size_t pos = 0;
         while (total - pos >= 4)
         {
-            uint len = s[pos] | (cast(uint) s[pos + 1] << 8)
+            uint raw = s[pos] | (cast(uint) s[pos + 1] << 8)
                 | (cast(uint) s[pos + 2] << 16) | (cast(uint) s[pos + 3] << 24);
+            immutable compressed = (raw & COMPRESSED_FLAG) != 0;
+            immutable uint len = raw & LENGTH_MASK; // flag stripped
             if (len > 64 * 1024 * 1024)
                 break;
             if (total - pos - 4 < len)
                 break; // incomplete
-            dispatchFrame(s[pos + 4 .. pos + 4 + len]);
+            auto payload = s[pos + 4 .. pos + 4 + len];
+            if (compressed)
+                dispatchCompressed(payload);
+            else
+                dispatchFrame(payload);
             pos += 4 + len;
         }
         if (pos > 0)
@@ -263,6 +335,23 @@ final class VibeTransport
                 memmove(s.ptr, s.ptr + pos, rem);
             buf.length = rem;
         }
+    }
+
+    // A compressed frame payload is [u32 origLen][lz4 bytes]; decompress into
+    // the reused scratch, then hand the restored [u32 sender][kind][fields] to
+    // the normal path. A missing decompressor or a bad block drops the frame —
+    // raft retries via heartbeat, never acting on a partial decode.
+    private void dispatchCompressed(scope const(ubyte)[] payload) nothrow @system
+    {
+        if (decompressFn is null || payload.length < 4)
+            return;
+        immutable origLen = payload[0] | (cast(uint) payload[1] << 8)
+            | (cast(uint) payload[2] << 16) | (cast(uint) payload[3] << 24);
+        if (origLen == 0 || origLen > 128 * 1024 * 1024)
+            return; // bound the decode buffer against a malformed/huge header
+        if (!decompressFn(payload[4 .. $], origLen, dbuf))
+            return;
+        dispatchFrame(dbuf.data);
     }
 
     private void dispatchFrame(scope const(ubyte)[] frameBody) nothrow
@@ -278,5 +367,158 @@ final class VibeTransport
         if (!ok)
             return;
         onMessage(sender, kind, body_);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests — the compression FRAMING (flag bit, origLen header, decode path). The
+// codec itself is the host's (dreads' liblz4); here a tiny reversible RLE
+// stands in so the test has no external dependency. TCP is not exercised: we
+// drive the private frame builder/consumer directly (same module).
+// ---------------------------------------------------------------------------
+
+version (unittest)
+{
+    import fluent.asserts;
+
+    // A real (if humble) codec: run-length encode. Exact inverse for any input,
+    // and it shrinks the redundant bodies the test crafts — enough to trip the
+    // "actually compress" path (clen + 4 < body.length).
+    private size_t rleCompress(scope const(ubyte)[] src, ref ByteVec dst) nothrow @system
+    {
+        dst.clear();
+        size_t i = 0;
+        while (i < src.length)
+        {
+            immutable b = src[i];
+            size_t run = 1;
+            while (i + run < src.length && src[i + run] == b && run < 255)
+                run++;
+            ubyte[2] pair = [cast(ubyte) run, b];
+            appendBytes(dst, pair[]);
+            i += run;
+        }
+        return dst.length;
+    }
+
+    private bool rleDecompress(scope const(ubyte)[] src, size_t origLen, ref ByteVec dst) nothrow @system
+    {
+        dst.clear();
+        if (src.length % 2 != 0)
+            return false;
+        for (size_t i = 0; i < src.length; i += 2)
+        {
+            immutable cnt = src[i];
+            ubyte[1] one = [src[i + 1]];
+            foreach (_; 0 .. cnt)
+                appendBytes(dst, one[]);
+        }
+        return dst.data.length == origLen;
+    }
+
+    // Build a full frame [u32 len][body] from a raw body.
+    private ByteVec frameOf(scope const(ubyte)[] body_) @system
+    {
+        ByteVec f;
+        f.length = 4;
+        f.patchU32(0, cast(uint) body_.length);
+        appendBytes(f, body_);
+        return f;
+    }
+
+    // A well-formed raft frame body: [u32 sender][u8 kind][fields...], made
+    // highly redundant (long runs) so RLE shrinks it well below threshold.
+    private ByteVec redundantBody(NodeId sender, MsgKind kind, size_t fill) @system
+    {
+        ByteVec b;
+        b.length = 4;
+        b.patchU32(0, sender);
+        ubyte[1] k = [cast(ubyte) kind];
+        appendBytes(b, k[]);
+        ubyte[300] runs = void;
+        foreach (i; 0 .. fill)
+            runs[i] = cast(ubyte)('A' + (i / 100)); // 'A','B','C' runs of 100
+        appendBytes(b, runs[0 .. fill]);
+        return b;
+    }
+
+    @("vibetransport.compressed_frame_roundtrips")
+    unittest
+    {
+        auto t = new VibeTransport(1, []);
+        t.setCompression(&rleCompress, &rleDecompress);
+
+        // capture what the receive path delivers
+        NodeId gotFrom;
+        MsgKind gotKind;
+        ByteVec gotBody;
+        bool fired;
+        t.setHandler((NodeId from, MsgKind kind, scope const(ubyte)[] body_) nothrow{
+            gotFrom = from;
+            gotKind = kind;
+            gotBody.clear();
+            appendBytes(gotBody, body_);
+            fired = true;
+        });
+
+        auto body_ = redundantBody(7, MsgKind.appendEntries, 296); // 301-byte body
+        auto framed = frameOf(body_.data);
+
+        // leader side: it MUST choose to compress (body >= 256, RLE wins big)
+        auto onWire = t.maybeCompress(framed.data);
+        immutable raw = onWire[0] | (cast(uint) onWire[1] << 8)
+            | (cast(uint) onWire[2] << 16) | (cast(uint) onWire[3] << 24);
+        (raw & 0x8000_0000u).expect.to.equal(0x8000_0000u); // flag set
+        (onWire.length < framed.data.length).expect.to.equal(true); // smaller on the wire
+
+        // follower side: feed the compressed frame through the real consumer
+        ByteVec rx;
+        appendBytes(rx, onWire);
+        t.consumeFrames(rx);
+
+        fired.expect.to.equal(true);
+        gotFrom.expect.to.equal(7U); // sender recovered from the restored body
+        gotKind.expect.to.equal(MsgKind.appendEntries);
+        // delivered body is [kind][fields] = restored body minus the 4 sender bytes
+        (gotBody.data == body_.data[4 .. $]).expect.to.equal(true);
+    }
+
+    @("vibetransport.small_frame_stays_plaintext")
+    unittest
+    {
+        auto t = new VibeTransport(1, []);
+        t.setCompression(&rleCompress, &rleDecompress);
+        // a tiny body (< COMPRESS_MIN) must go uncompressed — flag clear
+        auto body_ = redundantBody(3, MsgKind.requestVoteReply, 40); // ~45 bytes
+        auto framed = frameOf(body_.data);
+        auto onWire = t.maybeCompress(framed.data);
+        immutable raw = onWire[0] | (cast(uint) onWire[1] << 8)
+            | (cast(uint) onWire[2] << 16) | (cast(uint) onWire[3] << 24);
+        (raw & 0x8000_0000u).expect.to.equal(0U); // NOT compressed
+        (onWire.ptr == framed.data.ptr).expect.to.equal(true); // same buffer, untouched
+    }
+
+    @("vibetransport.plaintext_still_decodes_with_codec_installed")
+    unittest
+    {
+        // A peer that doesn't compress (plaintext frame) must still be understood
+        // by a node that has the codec installed (mixed / rolling config).
+        auto t = new VibeTransport(1, []);
+        t.setCompression(&rleCompress, &rleDecompress);
+        NodeId gotFrom;
+        bool fired;
+        t.setHandler((NodeId from, MsgKind kind, scope const(ubyte)[] body_) nothrow{
+            cast(void) kind;
+            cast(void) body_;
+            gotFrom = from;
+            fired = true;
+        });
+        auto body_ = redundantBody(9, MsgKind.appendEntries, 296);
+        auto framed = frameOf(body_.data); // plaintext, no flag
+        ByteVec rx;
+        appendBytes(rx, framed.data);
+        t.consumeFrames(rx);
+        fired.expect.to.equal(true);
+        gotFrom.expect.to.equal(9U);
     }
 }
