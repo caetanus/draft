@@ -211,7 +211,11 @@ bool decodeInstallSnapshot(scope const(ubyte)[] body_, out InstallSnapshot m) no
     auto len = r.u32();
     if (!r.ok)
         return false;
-    m.data = r.bytes(len).dup;
+    // slice into body_, NOT a GC .dup: onInstallSnapshot copies the chunk into
+    // its staging buffer synchronously within this dispatch (same lifetime rule
+    // as decodeAppendEntries' payloads). A per-chunk .dup here leaked on every
+    // snapshot chunk under the server's GC.disable.
+    m.data = r.bytes(len);
     return r.ok;
 }
 
@@ -428,6 +432,9 @@ version (unittest)
         got.totalLen.expect.to.equal(10_000_000UL);
         got.done.expect.to.equal(false);
         (got.data == chunk).expect.to.equal(true);
+        // the chunk must be a SLICE into the frame body, not a GC .dup (which
+        // leaked per chunk under GC.disable) — assert it aliases the input
+        (got.data.ptr >= b.ptr && got.data.ptr < b.ptr + b.length).expect.to.equal(true);
 
         // the reply carries progress (bytesStored) + the installed flag
         InstallSnapshotReply r = {

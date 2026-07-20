@@ -259,6 +259,68 @@ version (unittest)
         (st.snapshotData == b[]).expect.to.equal(true); // all of B, no A bytes spliced in
     }
 
+    @("raft.snapshot_staging_is_bounded")
+    unittest
+    {
+        // Red-team (DoS): the follower stages chunks in memory before install.
+        // A peer that streams chunks past the declared totalLen — or never sends
+        // `done` — must NOT be able to grow the buffer without bound. Malformed
+        // chunks are rejected; a legit transfer still completes at the exact size.
+        import raft.node : RaftNode, Config;
+        import raft.types : InstallSnapshot;
+
+        auto st = new MemoryStorage;
+        Config cfg;
+        cfg.self = 2;
+        cfg.peers = [1, 3];
+        cfg.snapshotChunkBytes = 4;
+        auto node = new RaftNode(cfg, st);
+        void feed(NodeId from, InstallSnapshot m)
+        {
+            node.onInstallSnapshot(from, m);
+        }
+
+        ubyte[64] good;
+        good[] = 0xAA;
+        ubyte[64] evil;
+        evil[] = 0xEE;
+
+        // legit start: totalLen=8, first 4 bytes
+        feed(1, InstallSnapshot(5, 1, 100, 5, 0, 8, false, good[0 .. 4]));
+        // MALICIOUS #1: a 60-byte chunk at offset 4 (would blow past total=8)
+        feed(1, InstallSnapshot(5, 1, 100, 5, 4, 8, false, evil[0 .. 60]));
+        // MALICIOUS #2: inconsistent, huge declared total mid-transfer
+        feed(1, InstallSnapshot(5, 1, 100, 5, 4, 4_000_000_000, false, evil[0 .. 60]));
+        st.snapshotIndex.expect.to.equal(0UL); // nothing oversized installed
+
+        // legit completion: the pinned 8-byte total, exactly
+        feed(1, InstallSnapshot(5, 1, 100, 5, 4, 8, true, good[4 .. 8]));
+        st.snapshotIndex.expect.to.equal(100UL);
+        st.snapshotData.length.expect.to.equal(8UL); // staging was never grown
+        (st.snapshotData == good[0 .. 8]).expect.to.equal(true);
+    }
+
+    @("raft.snapshot_max_size_cap_rejects")
+    unittest
+    {
+        // With maxSnapshotBytes set, a snapshot declaring more is refused before
+        // a single byte is staged.
+        import raft.node : RaftNode, Config;
+        import raft.types : InstallSnapshot;
+
+        auto st = new MemoryStorage;
+        Config cfg;
+        cfg.self = 2;
+        cfg.peers = [1, 3];
+        cfg.maxSnapshotBytes = 1024;
+        auto node = new RaftNode(cfg, st);
+
+        ubyte[16] buf;
+        auto m = InstallSnapshot(5, 1, 100, 5, 0, 1_000_000, false, buf[0 .. 16]);
+        node.onInstallSnapshot(1, m);
+        st.snapshotIndex.expect.to.equal(0UL); // refused, nothing staged
+    }
+
     @("raft.snapshot_then_more_log")
     unittest
     {

@@ -261,24 +261,39 @@ const(ubyte)[] encodeConfig(const ref Configuration c) nothrow
 // not a leak. Making Configuration malloc-owned would thread free() through a
 // value type copied across the node (changeMembership, refreshConfigFromLog),
 // which is far more bug-prone than the drip is worth.
+// A cluster is tiny; a member count beyond this is a malformed/hostile config
+// entry. Bounding it stops a crafted count (u32, up to 4e9) from driving a
+// multi-GB allocation / multi-billion-iteration loop on the config-decode path,
+// which is reachable from an appended (peer-supplied) log entry.
+enum MAX_MEMBERS = 1024;
+
 Configuration decodeConfig(scope const(ubyte)[] payload) nothrow
 {
     Configuration c;
     size_t i = CONFIG_TAG.length;
+    bool truncated = false;
     uint u32()
     {
+        if (i + 4 > payload.length)
+        {
+            truncated = true;
+            return 0;
+        }
         uint v = 0;
-        if (i + 4 <= payload.length)
-            foreach (k; 0 .. 4)
-                v |= cast(uint) payload[i++] << (8 * k);
+        foreach (k; 0 .. 4)
+            v |= cast(uint) payload[i++] << (8 * k);
         return v;
     }
 
     auto nNew = u32();
+    if (nNew > MAX_MEMBERS)
+        return Configuration.init; // malformed: refuse rather than allocate
     foreach (_; 0 .. nNew)
         c.cNew ~= u32();
     auto nOld = u32();
+    if (nOld > MAX_MEMBERS || truncated)
+        return Configuration.init;
     foreach (_; 0 .. nOld)
         c.cOld ~= u32();
-    return c;
+    return truncated ? Configuration.init : c;
 }

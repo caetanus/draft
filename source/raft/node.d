@@ -27,6 +27,10 @@ struct Config
     // bounds each frame well under the transport's per-frame cap and lets
     // heartbeats/other RPCs interleave with a large transfer. Tests set it small
     // to force multi-chunk transfers deterministically.
+    ulong maxSnapshotBytes; // hard cap on an accepted snapshot's declared size
+    // (0 = no cap). A follower stages incoming chunks in memory before install,
+    // so an unbounded declared size lets a peer OOM it; hosts should set this to
+    // ~maxmemory. Independent of the per-chunk framing bound.
 }
 
 enum NOOP_PAYLOAD = cast(const(ubyte)[]) "\0raft-noop";
@@ -65,6 +69,9 @@ struct RaftNode
     // transfer — chunks from a different leader term belong to a physically
     // different snapshot (same committed state can serialize to different bytes),
     // so they must never be spliced into this one
+    private ulong snapStagingTotal; // totalLen pinned at offset 0: the staging
+    // buffer is bounded to this so a peer can't grow it without limit
+    private ulong maxSnapshotBytes; // cap on an accepted snapshot (0 = none)
     private Vec!RaftMessage outbox; // malloc-backed, reused each cycle (zero-GC)
     private Vec!RaftMessage readyMessages; // takeReady snapshot, isolated from later emits
     private Vec!NodeId otherScratch; // reused by otherServers(), consumed synchronously
@@ -86,6 +93,7 @@ struct RaftNode
         this.electionTimeoutTicks = cfg.electionTimeoutTicks;
         this.heartbeatTicks = cfg.heartbeatTicks;
         this.snapshotChunkBytes = cfg.snapshotChunkBytes ? cfg.snapshotChunkBytes : 1;
+        this.maxSnapshotBytes = cfg.maxSnapshotBytes;
         this.storage = storage;
         this.rng = cfg.seed | 1;
         bootstrapConfig.cNew = cfg.joinMode ? cfg.peers.dup : cfg.self ~ cfg.peers;
@@ -745,10 +753,32 @@ struct RaftNode
                         rpc.lastIncludedIndex, 0, false));
                 return;
             }
+            // Reject an oversized snapshot up front (a follower stages the whole
+            // thing in memory before install, so an unbounded declared size is a
+            // remote-OOM lever on the unauthenticated transport).
+            if (maxSnapshotBytes != 0 && rpc.totalLen > maxSnapshotBytes)
+            {
+                emitIsr(from, InstallSnapshotReply(storage.currentTerm,
+                        rpc.lastIncludedIndex, 0, false));
+                return;
+            }
             snapStaging.clear();
             snapStagingIndex = rpc.lastIncludedIndex;
             snapStagingTerm = rpc.lastIncludedTerm;
             snapStagingLeaderTerm = rpc.term;
+            snapStagingTotal = rpc.totalLen; // pinned: bounds the staging buffer
+        }
+
+        // Well-formedness: every chunk must agree on the total and stay within it.
+        // Without this a peer streams contiguous chunks and never sends `done`,
+        // growing the staging buffer without bound (OOM). `offset <= total` is
+        // checked before the subtraction so it can't underflow.
+        if (rpc.totalLen != snapStagingTotal || rpc.offset > snapStagingTotal
+                || rpc.data.length > snapStagingTotal - rpc.offset)
+        {
+            emitIsr(from, InstallSnapshotReply(storage.currentTerm,
+                    rpc.lastIncludedIndex, snapStaging.length, false));
+            return;
         }
 
         // Accept only a strictly contiguous chunk. A duplicate (offset < length)
@@ -761,7 +791,7 @@ struct RaftNode
         // Install ONLY on the final chunk, once the whole snapshot is contiguous.
         // This is the soundness core: a partial transfer never reaches the state
         // machine, so a torn/aborted snapshot is invisible.
-        if (rpc.done && have >= rpc.totalLen)
+        if (rpc.done && have == snapStagingTotal)
         {
             storage.saveSnapshot(snapStagingIndex, snapStagingTerm, snapStaging.data);
             if (persistedIndex_ < snapStagingIndex)
@@ -776,6 +806,7 @@ struct RaftNode
             snapStaging.clear();
             snapStagingIndex = 0;
             snapStagingLeaderTerm = 0;
+            snapStagingTotal = 0;
             emitIsr(from, InstallSnapshotReply(storage.currentTerm, installed, have, true));
             return;
         }

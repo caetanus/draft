@@ -17,6 +17,29 @@ version (unittest)
         return cast(const(ubyte)[]) s;
     }
 
+    @("raft.config_decode_rejects_alloc_bomb")
+    unittest
+    {
+        // Red-team (DoS): decodeConfig runs on peer-supplied log entries. A
+        // crafted member count (u32, ~4e9) must NOT drive a giant allocation /
+        // multi-billion-iteration loop. Without the MAX_MEMBERS cap this test
+        // would hang and OOM instead of returning.
+        import raft.types : decodeConfig, encodeConfig, Configuration;
+
+        // "\0raft-conf:" tag, then nNew = 0xFFFFFFFF, and nothing else
+        auto bomb = cast(const(ubyte)[])("\x00raft-conf:\xff\xff\xff\xff");
+        auto c = decodeConfig(bomb);
+        c.cNew.length.expect.to.equal(0); // refused, not 4 billion entries
+        c.cOld.length.expect.to.equal(0);
+
+        // a well-formed 3-member config still decodes fine (round-trip)
+        Configuration good;
+        good.cNew = [1, 2, 3];
+        auto round = decodeConfig(encodeConfig(good));
+        round.cNew.length.expect.to.equal(3);
+        (round.cNew == [1U, 2U, 3U]).expect.to.equal(true);
+    }
+
     private bool memberOf(Cluster c, NodeId node, NodeId id) nothrow
     {
         foreach (m; c.nodes[node - 1].members)
