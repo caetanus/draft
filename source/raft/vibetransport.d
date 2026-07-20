@@ -77,8 +77,8 @@ final class VibeTransport
         peerState[p.id] = st;
         if (running)
         {
-            runTask(() nothrow { connectLoop(st); });
-            runTask(() nothrow { writeLoop(st); });
+            cast(void) runTask(() nothrow { connectLoop(st); });
+            cast(void) runTask(() nothrow { writeLoop(st); });
         }
     }
 
@@ -87,13 +87,13 @@ final class VibeTransport
         running = true;
         // SO_REUSEADDR + SO_REUSEPORT so a restarted node rebinds its raft
         // port immediately instead of waiting out TIME_WAIT.
-        listenTCP(listenPort, (conn) @trusted nothrow { receiveLoop(conn); },
+        cast(void) listenTCP(listenPort, (conn) @trusted nothrow { receiveLoop(conn); },
                 TCPListenOptions.reuseAddress | TCPListenOptions.reusePort);
         foreach (id, st; peerState)
         {
             auto peer = st;
-            runTask(() nothrow { connectLoop(peer); });
-            runTask(() nothrow { writeLoop(peer); });
+            cast(void) runTask(() nothrow { connectLoop(peer); });
+            cast(void) runTask(() nothrow { writeLoop(peer); });
         }
     }
 

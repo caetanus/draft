@@ -119,7 +119,7 @@ private const(ubyte)[] frame(NodeId sender, MsgKind kind,
     putU32(frameScratch, 0); // length placeholder, back-patched below
     putU32(frameScratch, sender);
     putU8(frameScratch, kind);
-    body_(frameScratch);
+    cast(void) body_(frameScratch);
     // frame = [u32 len][u32 sender][u8 kind][fields]; len covers everything
     // after the prefix (sender + kind + fields).
     frameScratch.patchU32(0, cast(uint)(frameScratch.length - 4));
