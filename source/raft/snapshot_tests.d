@@ -215,6 +215,50 @@ version (unittest)
         (c.snapBytesSent <= snapSize * 2).expect.to.equal(true);
     }
 
+    @("raft.snapshot_never_mixes_two_leaders")
+    unittest
+    {
+        // Regression (safety): a leadership change mid-transfer. Leader A (term 5)
+        // ships a partial snapshot@100; A is deposed and leader B (term 6) ships
+        // ITS snapshot of the same committed index — whose bytes differ (the same
+        // committed state can serialize differently). The follower must install
+        // B's snapshot WHOLE, never a splice of A's prefix + B's suffix, which
+        // would be a torn, unloadable snapshot = silent state corruption.
+        import raft.node : RaftNode, Config;
+        import raft.types : InstallSnapshot;
+
+        auto st = new MemoryStorage;
+        Config cfg;
+        cfg.self = 2;
+        cfg.peers = [1, 3];
+        cfg.snapshotChunkBytes = 4;
+        auto node = new RaftNode(cfg, st);
+        // onInstallSnapshot takes `ref const`, so feed lvalues through a helper
+        void feed(NodeId from, InstallSnapshot m)
+        {
+            node.onInstallSnapshot(from, m);
+        }
+
+        ubyte[16] a;
+        a[] = 0xAA; // leader A's snapshot bytes
+        ubyte[16] b;
+        b[] = 0xBB; // leader B's snapshot bytes (same index, different layout)
+
+        // A (term 5) delivers the first half, then stalls (deposed)
+        feed(1, InstallSnapshot(5, 1, 100, 5, 0, 16, false, a[0 .. 4]));
+        feed(1, InstallSnapshot(5, 1, 100, 5, 4, 16, false, a[4 .. 8]));
+        st.snapshotIndex.expect.to.equal(0UL); // nothing installed yet
+
+        // B (term 6) ships its whole snapshot from offset 0
+        feed(3, InstallSnapshot(6, 3, 100, 5, 0, 16, false, b[0 .. 4]));
+        feed(3, InstallSnapshot(6, 3, 100, 5, 4, 16, false, b[4 .. 8]));
+        feed(3, InstallSnapshot(6, 3, 100, 5, 8, 16, false, b[8 .. 12]));
+        feed(3, InstallSnapshot(6, 3, 100, 5, 12, 16, true, b[12 .. 16]));
+
+        st.snapshotIndex.expect.to.equal(100UL);
+        (st.snapshotData == b[]).expect.to.equal(true); // all of B, no A bytes spliced in
+    }
+
     @("raft.snapshot_then_more_log")
     unittest
     {

@@ -60,7 +60,11 @@ struct RaftNode
     // Follower-side staging: accumulate chunks, install ATOMICALLY on `done` only.
     private ByteVec snapStaging;
     private Index snapStagingIndex; // lastIncludedIndex being staged (0 = none)
-    private Term snapStagingTerm;
+    private Term snapStagingTerm; // lastIncludedTerm of the staged snapshot
+    private Term snapStagingLeaderTerm; // leader term (rpc.term) that STARTED this
+    // transfer — chunks from a different leader term belong to a physically
+    // different snapshot (same committed state can serialize to different bytes),
+    // so they must never be spliced into this one
     private Vec!RaftMessage outbox; // malloc-backed, reused each cycle (zero-GC)
     private Vec!RaftMessage readyMessages; // takeReady snapshot, isolated from later emits
     private Vec!NodeId otherScratch; // reused by otherServers(), consumed synchronously
@@ -724,16 +728,19 @@ struct RaftNode
             return;
         }
 
-        // (Re)start staging when this is a different snapshot than the one in
-        // progress — a newer snapshot supersedes any in-flight transfer. Without
-        // a staging buffer for it, a mid-stream chunk (offset != 0) can't be
-        // used: re-ack 0 to force the leader back to the start.
-        if (snapStagingIndex != rpc.lastIncludedIndex)
+        // (Re)start staging when this chunk belongs to a DIFFERENT transfer than
+        // the one in progress: a different snapshot index, OR a different leader
+        // term at the same index. The latter is the subtle one — after an
+        // election the new leader ships its own snapshot of the same committed
+        // state, whose bytes may differ from the old leader's; splicing the two
+        // would install a torn snapshot. A different transfer can only be adopted
+        // at offset 0; a mid-stream chunk is re-acked with 0 to force a restart.
+        // (Stale chunks from the OLD leader are already rejected above by the
+        // rpc.term < currentTerm guard once we've stepped to the new term.)
+        if (snapStagingIndex != rpc.lastIncludedIndex || snapStagingLeaderTerm != rpc.term)
         {
             if (rpc.offset != 0)
             {
-                // no staging for this snapshot yet + a mid-stream chunk: echo the
-                // request's index with 0 progress so the leader restarts at offset 0
                 emitIsr(from, InstallSnapshotReply(storage.currentTerm,
                         rpc.lastIncludedIndex, 0, false));
                 return;
@@ -741,6 +748,7 @@ struct RaftNode
             snapStaging.clear();
             snapStagingIndex = rpc.lastIncludedIndex;
             snapStagingTerm = rpc.lastIncludedTerm;
+            snapStagingLeaderTerm = rpc.term;
         }
 
         // Accept only a strictly contiguous chunk. A duplicate (offset < length)
@@ -767,6 +775,7 @@ struct RaftNode
             const installed = snapStagingIndex;
             snapStaging.clear();
             snapStagingIndex = 0;
+            snapStagingLeaderTerm = 0;
             emitIsr(from, InstallSnapshotReply(storage.currentTerm, installed, have, true));
             return;
         }
