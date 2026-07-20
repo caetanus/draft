@@ -124,16 +124,29 @@ final class Cluster
     private Envelope[] queue;
     private ulong rng;
     uint dropPercent; // seeded random message loss
+    uint snapChunkBytes = 4 * 1024 * 1024; // InstallSnapshot chunk size baked into
+    // spawned nodes; set via the ctor (see below), NOT after construction
+    size_t snapPad; // extra filler bytes appended to each snapshot (to force
+    // multi-chunk transfers when snapChunkBytes is set small); safe to set anytime
+    // before compactLeader()
+
+    // InstallSnapshot transfer instrumentation (wire-efficiency benchmark guard)
+    size_t snapBytesSent; // total chunk bytes routed
+    size_t snapMsgsSent; // total InstallSnapshot messages routed
+    size_t snapMaxMsgBytes; // largest single chunk payload (per-frame-cap guard)
 
     private NodeId[Term] leaderOfTerm;
     private const(ubyte)[][] appliedLog;
     private size_t[] appliedPositionsStore;
     Index highestCommitSeen;
 
-    this(size_t n, ulong seed = 42) nothrow
+    // `chunkBytes` must be a ctor arg (not a settable field) because the founding
+    // nodes — including the leader that ships snapshots — bake it in at spawn.
+    this(size_t n, ulong seed = 42, uint chunkBytes = 4 * 1024 * 1024) nothrow
     {
         this.n = n;
         this.rng = seed | 1;
+        this.snapChunkBytes = chunkBytes;
         storages = new MemoryStorage[n];
         nodes = new RaftNode*[n];
         alive = new bool[n];
@@ -163,6 +176,7 @@ final class Cluster
         cfg.self = cast(NodeId)(i + 1);
         cfg.peers = peers;
         cfg.seed = rng + i * 7919;
+        cfg.snapshotChunkBytes = snapChunkBytes;
         nodes[i] = new RaftNode(cfg, storages[i]);
     }
 
@@ -318,7 +332,13 @@ final class Cluster
             m.ae.entries = copy;
         }
         else if (m.type == MessageType.installSnapshot)
+        {
             m.is_.data = m.is_.data.dup;
+            snapMsgsSent++;
+            snapBytesSent += m.is_.data.length;
+            if (m.is_.data.length > snapMaxMsgBytes)
+                snapMaxMsgBytes = m.is_.data.length;
+        }
         queue ~= Envelope(from, m);
     }
 
@@ -331,10 +351,15 @@ final class Cluster
             return;
         auto upto = nodes[l - 1].commitIndex;
         auto count = appliedPositions[l - 1];
-        ubyte[8] data;
+        // First 8 bytes = applied-entry count (what a follower decodes to
+        // fast-forward); the rest is deterministic filler so a small
+        // snapChunkBytes forces a multi-chunk transfer.
+        auto data = new ubyte[8 + snapPad];
         foreach (b; 0 .. 8)
             data[b] = cast(ubyte)(count >> (8 * b));
-        nodes[l - 1].compact(upto, data[]);
+        foreach (b; 0 .. snapPad)
+            data[8 + b] = cast(ubyte)((count + b) * 31 + b);
+        nodes[l - 1].compact(upto, data);
     }
 
     NodeId leader() nothrow

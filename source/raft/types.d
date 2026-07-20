@@ -112,21 +112,34 @@ struct AppendEntriesReply
 // This is what makes async durability correct.
 
 // InstallSnapshot (§7): when the leader has compacted the log past the entries
-// a follower still needs, it ships a state-machine snapshot instead. One
-// message here (real Raft chunks large snapshots — noted as a scaling step).
+// a follower still needs, it ships a state-machine snapshot instead. The
+// snapshot is transferred in `chunk`-sized pieces (offset/done) rather than one
+// giant frame — a multi-GB blob in a single message overruns the transport's
+// per-frame cap (stalling replication outright) and blocks heartbeats behind
+// one huge write (spurious elections). Chunks are sound: the follower only
+// installs on the final `done` piece, accepts strictly contiguous offsets, and
+// echoes its progress so a lost/reordered chunk resends from the gap.
 struct InstallSnapshot
 {
     Term term;
     NodeId leaderId;
     Index lastIncludedIndex;
     Term lastIncludedTerm;
-    const(ubyte)[] data; // opaque state-machine snapshot (host-defined)
+    ulong offset; // byte offset of THIS chunk within the full snapshot
+    ulong totalLen; // full snapshot size (lets the follower preallocate + sanity-check)
+    bool done; // true iff this is the final chunk (offset + data.length == totalLen)
+    const(ubyte)[] data; // THIS chunk's bytes (a slice of the state-machine snapshot)
 }
 
 struct InstallSnapshotReply
 {
     Term term;
-    Index lastIncludedIndex; // echoed so the leader advances matchIndex/nextIndex
+    Index lastIncludedIndex; // the snapshot index this reply concerns (echo of the
+    // request's lastIncludedIndex) — lets the leader ignore a reply for an
+    // already-superseded transfer
+    ulong bytesStored; // contiguous bytes the follower has accepted for that
+    // snapshot (== the next offset it expects); the leader's resume/ack point
+    bool installed; // true iff the follower has fully installed lastIncludedIndex
 }
 
 enum MessageType : ubyte

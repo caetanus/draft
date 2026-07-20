@@ -179,6 +179,9 @@ const(ubyte)[] encodeInstallSnapshot(NodeId sender, const ref InstallSnapshot m)
         putU32(o, m.leaderId);
         putU64(o, m.lastIncludedIndex);
         putU64(o, m.lastIncludedTerm);
+        putU64(o, m.offset);
+        putU64(o, m.totalLen);
+        putU8(o, m.done ? 1 : 0);
         putU32(o, cast(uint) m.data.length);
         appendBytes(o, m.data);
     });
@@ -189,6 +192,8 @@ const(ubyte)[] encodeInstallSnapshotReply(NodeId sender, const ref InstallSnapsh
     return frame(sender, MsgKind.installSnapshotReply, (ref o) {
         putU64(o, m.term);
         putU64(o, m.lastIncludedIndex);
+        putU64(o, m.bytesStored);
+        putU8(o, m.installed ? 1 : 0);
     });
 }
 
@@ -200,6 +205,9 @@ bool decodeInstallSnapshot(scope const(ubyte)[] body_, out InstallSnapshot m) no
     m.leaderId = r.u32();
     m.lastIncludedIndex = r.u64();
     m.lastIncludedTerm = r.u64();
+    m.offset = r.u64();
+    m.totalLen = r.u64();
+    m.done = r.u8() != 0;
     auto len = r.u32();
     if (!r.ok)
         return false;
@@ -213,6 +221,8 @@ bool decodeInstallSnapshotReply(scope const(ubyte)[] body_, out InstallSnapshotR
     r.u8();
     m.term = r.u64();
     m.lastIncludedIndex = r.u64();
+    m.bytesStored = r.u64();
+    m.installed = r.u8() != 0;
     return r.ok;
 }
 
@@ -395,6 +405,41 @@ version (unittest)
         AppendEntries got;
         decodeAppendEntries(body_(encodeAppendEntries(2, m), s), got).expect.to.equal(true);
         got.entries.length.expect.to.equal(0); // heartbeat carries no entries
+    }
+
+    @("wire.install_snapshot_chunk_roundtrips")
+    unittest
+    {
+        // a middle chunk (offset > 0, not done) with NUL/high bytes intact
+        auto chunk = cast(const(ubyte)[]) "\x00\xffchunk\x01bytes\x00";
+        InstallSnapshot m = {
+            term: 12, leaderId: 3, lastIncludedIndex: 900, lastIncludedTerm: 11,
+            offset: 4_194_304, totalLen: 10_000_000, done: false, data: chunk
+        };
+        NodeId s;
+        auto b = body_(encodeInstallSnapshot(3, m), s);
+        s.expect.to.equal(3U);
+        InstallSnapshot got;
+        decodeInstallSnapshot(b, got).expect.to.equal(true);
+        got.term.expect.to.equal(12UL);
+        got.lastIncludedIndex.expect.to.equal(900UL);
+        got.lastIncludedTerm.expect.to.equal(11UL);
+        got.offset.expect.to.equal(4_194_304UL);
+        got.totalLen.expect.to.equal(10_000_000UL);
+        got.done.expect.to.equal(false);
+        (got.data == chunk).expect.to.equal(true);
+
+        // the reply carries progress (bytesStored) + the installed flag
+        InstallSnapshotReply r = {
+            term: 12, lastIncludedIndex: 900, bytesStored: 8_388_608, installed: false
+        };
+        InstallSnapshotReply gr;
+        decodeInstallSnapshotReply(body_(encodeInstallSnapshotReply(4, r), s), gr)
+            .expect.to.equal(true);
+        s.expect.to.equal(4U);
+        gr.lastIncludedIndex.expect.to.equal(900UL);
+        gr.bytesStored.expect.to.equal(8_388_608UL);
+        gr.installed.expect.to.equal(false);
     }
 
     @("wire.truncated_input_is_rejected")

@@ -23,6 +23,10 @@ struct Config
     ulong seed = 1;
     bool joinMode; // start as a passive learner: bootstrap config excludes
     // self so this node never self-elects until a committed config adds it
+    uint snapshotChunkBytes = 4 * 1024 * 1024; // InstallSnapshot chunk size (§7);
+    // bounds each frame well under the transport's per-frame cap and lets
+    // heartbeats/other RPCs interleave with a large transfer. Tests set it small
+    // to force multi-chunk transfers deterministically.
 }
 
 enum NOOP_PAYLOAD = cast(const(ubyte)[]) "\0raft-noop";
@@ -44,7 +48,19 @@ struct RaftNode
     private Index[NodeId] nextIndex;
     private Index[NodeId] matchIndex;
     private bool[NodeId] voteFrom;
-    private bool[NodeId] snapshotPending; // a snapshot is in flight to this follower
+    // Chunked InstallSnapshot flow control (pipelined window, per follower).
+    private uint snapshotChunkBytes;
+    private Index[NodeId] snapSendIndex; // snapshot index currently shipping to `to`
+    // (0 = none); a change means the leader recompacted, so restart the transfer
+    private ulong[NodeId] snapAcked; // bytesStored the follower confirmed = window base
+    private ulong[NodeId] snapSent; // highest offset optimistically sent = window head
+    private ulong[NodeId] snapAckedAtHb; // snapAcked at the previous heartbeat: only a
+    // STALLED transfer (no progress since) triggers a resend, so the clean path
+    // never redundantly re-ships in-flight chunks
+    // Follower-side staging: accumulate chunks, install ATOMICALLY on `done` only.
+    private ByteVec snapStaging;
+    private Index snapStagingIndex; // lastIncludedIndex being staged (0 = none)
+    private Term snapStagingTerm;
     private Vec!RaftMessage outbox; // malloc-backed, reused each cycle (zero-GC)
     private Vec!RaftMessage readyMessages; // takeReady snapshot, isolated from later emits
     private Vec!NodeId otherScratch; // reused by otherServers(), consumed synchronously
@@ -65,6 +81,7 @@ struct RaftNode
         this.self = cfg.self;
         this.electionTimeoutTicks = cfg.electionTimeoutTicks;
         this.heartbeatTicks = cfg.heartbeatTicks;
+        this.snapshotChunkBytes = cfg.snapshotChunkBytes ? cfg.snapshotChunkBytes : 1;
         this.storage = storage;
         this.rng = cfg.seed | 1;
         bootstrapConfig.cNew = cfg.joinMode ? cfg.peers.dup : cfg.self ~ cfg.peers;
@@ -209,14 +226,21 @@ struct RaftNode
                     fprintf(stderr, "[%lld] HB self=%u\n",
                             cast(long) MonoTime.currTime.ticks, self);
                 }
-                // Clear the in-flight snapshot flag so a follower still behind
-                // gets one retry this heartbeat (bounds a lost snapshot to
-                // heartbeat rate). Lost appends self-heal via reject/backoff, so
-                // the pipeline window needs no per-heartbeat reset.
+                // Backstop for a lost snapshot chunk: if a transfer made NO
+                // progress since the last heartbeat it's stalled (a chunk was
+                // lost), so rewind its window head to the acked base and let
+                // broadcastAppend resend from the gap. A healthy transfer keeps
+                // advancing, so this never re-ships in-flight chunks on the clean
+                // path. Lost appends self-heal via reject/backoff.
                 foreach (m; otherServers())
                 {
-                    if (m in snapshotPending)
-                        snapshotPending[m] = false;
+                    if (m in snapSendIndex)
+                    {
+                        const acked = ulongGet(snapAcked, m, 0);
+                        if (acked == ulongGet(snapAckedAtHb, m, ulong.max))
+                            snapSent[m] = acked;
+                        snapAckedAtHb[m] = acked;
+                    }
                 }
                 broadcastAppend();
             }
@@ -372,12 +396,11 @@ struct RaftNode
             auto nv = hinted < stepped ? hinted : stepped;
             nextIndex[from] = nv < 1 ? 1 : nv;
             // If the follower has backed up past the snapshot boundary it needs
-            // a snapshot; a prior InstallSnapshot may have been sent but its
-            // reply lost (leaving snapshotPending stuck). This live reject proves
-            // the follower is reachable, so clear the throttle to re-ship the
-            // snapshot now instead of waiting on a (possibly starved) heartbeat.
-            if (nextIndex[from] <= storage.snapshotIndex)
-                snapshotPending[from] = false;
+            // a snapshot. This live reject proves the follower is reachable, so
+            // rewind the transfer window to its acked base to re-ship from the
+            // gap now instead of waiting on a (possibly starved) heartbeat.
+            if (nextIndex[from] <= storage.snapshotIndex && (from in snapSendIndex))
+                snapSent[from] = ulongGet(snapAcked, from, 0);
             sendAppendTo(from);
         }
     }
@@ -480,6 +503,12 @@ struct RaftNode
         return p ? *p : false;
     }
 
+    private ulong ulongGet(const ref ulong[NodeId] m, NodeId k, ulong dflt) nothrow
+    {
+        auto p = k in m;
+        return p ? *p : dflt;
+    }
+
     private static bool contains(scope const(NodeId)[] s, NodeId id) @nogc nothrow
     {
         foreach (x; s)
@@ -554,7 +583,10 @@ struct RaftNode
         heartbeatCounter = 0;
         nextIndex = null;
         matchIndex = null;
-        snapshotPending = null;
+        snapSendIndex = null;
+        snapAcked = null;
+        snapSent = null;
+        snapAckedAtHb = null;
         foreach (m; otherServers())
         {
             nextIndex[m] = storage.lastIndex + 1;
@@ -571,21 +603,19 @@ struct RaftNode
     // wait for acks. Bounds the transport outbox for a slow follower; generous
     // enough to keep a healthy follower's pipe full over a localhost RTT.
     private enum MAX_INFLIGHT = MAX_BATCH * 16;
+    // Chunks kept in flight per follower during a snapshot transfer. The window
+    // = snapshotChunkBytes * this; big enough to keep the pipe full over an RTT,
+    // small enough that a catching-up follower's outbox stays bounded.
+    private enum SNAP_WINDOW_CHUNKS = 8;
 
     private void sendAppendTo(NodeId to) nothrow
     {
         auto ni = idxGet(nextIndex, to, storage.lastIndex + 1);
-        // the entries this follower needs were compacted away -> ship a snapshot,
-        // but at most one in flight: broadcastAppend runs on every write, and
-        // re-shipping the full (growing) snapshot each time explodes memory. The
-        // flag is cleared on the reply and once per heartbeat (lost-snapshot retry).
+        // the entries this follower needs were compacted away -> ship the snapshot
+        // instead, chunked with a pipelined window (see sendSnapshotChunks).
         if (ni <= storage.snapshotIndex)
         {
-            if (boolGet(snapshotPending, to))
-                return;
-            emitIs(to, InstallSnapshot(storage.currentTerm, self, storage.snapshotIndex,
-                    storage.snapshotTerm, storage.snapshotData));
-            snapshotPending[to] = true;
+            sendSnapshotChunks(to);
             return;
         }
         // Pipelined append: advance nextIndex OPTIMISTICALLY on send so the next
@@ -610,11 +640,60 @@ struct RaftNode
             nextIndex[to] = ni + batch.length; // optimistic advance
     }
 
+    // Ship the compacted snapshot to `to` in chunks, pipelined: fill an
+    // in-flight window of SNAP_WINDOW_CHUNKS chunks, advancing the window head
+    // (snapSent) optimistically on send. The window base (snapAcked) advances as
+    // the follower's replies confirm contiguous bytesStored; a lost/reordered
+    // chunk stalls snapAcked and is resent from that gap (on the next reply or,
+    // as a backstop, the per-heartbeat rewind). Sound because the follower only
+    // installs on `done` and accepts strictly contiguous offsets.
+    private void sendSnapshotChunks(NodeId to) nothrow
+    {
+        const snapIdx = storage.snapshotIndex;
+        if (snapIdx == 0)
+            return; // nothing compacted yet
+        // A different snapshot index than we were shipping means the leader
+        // recompacted mid-transfer: restart cleanly from offset 0.
+        if (idxGet(snapSendIndex, to, 0) != snapIdx)
+        {
+            snapSendIndex[to] = snapIdx;
+            snapAcked[to] = 0;
+            snapSent[to] = 0;
+        }
+        auto data = storage.snapshotData;
+        const total = data.length;
+        const term = storage.currentTerm;
+        const sterm = storage.snapshotTerm;
+        // Empty snapshot: one `done` frame carries (index, term); it re-sends at
+        // most once per cycle until the follower installs and acks.
+        if (total == 0)
+        {
+            emitIs(to, InstallSnapshot(term, self, snapIdx, sterm, 0, 0, true, null));
+            return;
+        }
+        const chunk = snapshotChunkBytes;
+        const window = cast(ulong) chunk * SNAP_WINDOW_CHUNKS;
+        const acked = ulongGet(snapAcked, to, 0);
+        auto sent = ulongGet(snapSent, to, 0);
+        while (sent < total && (sent - acked) < window)
+        {
+            auto end = sent + chunk;
+            if (end > total)
+                end = total;
+            const done = end >= total;
+            emitIs(to, InstallSnapshot(term, self, snapIdx, sterm, sent, total, done,
+                    data[cast(size_t) sent .. cast(size_t) end]));
+            sent = end;
+        }
+        snapSent[to] = sent;
+    }
+
     void onInstallSnapshot(NodeId from, const ref InstallSnapshot rpc) nothrow
     {
         if (rpc.term < storage.currentTerm)
         {
-            emitIsr(from, InstallSnapshotReply(storage.currentTerm, 0));
+            // stale leader: report our term, no progress
+            emitIsr(from, InstallSnapshotReply(storage.currentTerm, 0, 0, false));
             return;
         }
         if (rpc.term > storage.currentTerm)
@@ -623,20 +702,79 @@ struct RaftNode
         leaderId_ = rpc.leaderId;
         sinceHeard = 0;
         resetElectionDeadline();
-        // ignore a stale snapshot we already cover
-        if (rpc.lastIncludedIndex > storage.snapshotIndex && rpc.lastIncludedIndex > commitIndex_)
+
+        // Already covered: we hold this snapshot (or newer). Ack `installed` so
+        // the leader advances matchIndex and stops shipping.
+        if (rpc.lastIncludedIndex <= storage.snapshotIndex || rpc.lastIncludedIndex <= commitIndex_)
         {
-            storage.saveSnapshot(rpc.lastIncludedIndex, rpc.lastIncludedTerm, rpc.data);
-            if (persistedIndex_ < rpc.lastIncludedIndex)
-                persistedIndex_ = rpc.lastIncludedIndex;
-            commitIndex_ = rpc.lastIncludedIndex;
-            lastApplied = rpc.lastIncludedIndex;
+            emitIsr(from, InstallSnapshotReply(storage.currentTerm,
+                    rpc.lastIncludedIndex, 0, true));
+            return;
+        }
+
+        // A chunk for an OLDER snapshot than the one we are already staging is a
+        // straggler from a transfer the leader has since recompacted past;
+        // dropping it keeps a late offset-0 straggler from resetting our
+        // progress on the newer snapshot.
+        if (snapStagingIndex != 0 && rpc.lastIncludedIndex < snapStagingIndex)
+        {
+            // echo the (old) index so the leader — shipping a newer one — ignores it
+            emitIsr(from, InstallSnapshotReply(storage.currentTerm,
+                    rpc.lastIncludedIndex, 0, false));
+            return;
+        }
+
+        // (Re)start staging when this is a different snapshot than the one in
+        // progress — a newer snapshot supersedes any in-flight transfer. Without
+        // a staging buffer for it, a mid-stream chunk (offset != 0) can't be
+        // used: re-ack 0 to force the leader back to the start.
+        if (snapStagingIndex != rpc.lastIncludedIndex)
+        {
+            if (rpc.offset != 0)
+            {
+                // no staging for this snapshot yet + a mid-stream chunk: echo the
+                // request's index with 0 progress so the leader restarts at offset 0
+                emitIsr(from, InstallSnapshotReply(storage.currentTerm,
+                        rpc.lastIncludedIndex, 0, false));
+                return;
+            }
+            snapStaging.clear();
+            snapStagingIndex = rpc.lastIncludedIndex;
+            snapStagingTerm = rpc.lastIncludedTerm;
+        }
+
+        // Accept only a strictly contiguous chunk. A duplicate (offset < length)
+        // or a gap (offset > length) is dropped; we re-ack our contiguous
+        // progress so the leader resends from exactly the gap.
+        if (rpc.offset == snapStaging.length)
+            appendBytes(snapStaging, rpc.data);
+
+        const have = snapStaging.length;
+        // Install ONLY on the final chunk, once the whole snapshot is contiguous.
+        // This is the soundness core: a partial transfer never reaches the state
+        // machine, so a torn/aborted snapshot is invisible.
+        if (rpc.done && have >= rpc.totalLen)
+        {
+            storage.saveSnapshot(snapStagingIndex, snapStagingTerm, snapStaging.data);
+            if (persistedIndex_ < snapStagingIndex)
+                persistedIndex_ = snapStagingIndex;
+            commitIndex_ = snapStagingIndex;
+            lastApplied = snapStagingIndex;
             refreshConfigFromLog();
             // hand the snapshot to the host to load into the state machine
-            pendingSnapshot = new SnapshotToApply(rpc.lastIncludedIndex,
-                    rpc.lastIncludedTerm, rpc.data.dup);
+            pendingSnapshot = new SnapshotToApply(snapStagingIndex, snapStagingTerm,
+                    snapStaging.data.dup);
+            const installed = snapStagingIndex;
+            snapStaging.clear();
+            snapStagingIndex = 0;
+            emitIsr(from, InstallSnapshotReply(storage.currentTerm, installed, have, true));
+            return;
         }
-        emitIsr(from, InstallSnapshotReply(storage.currentTerm, storage.snapshotIndex));
+        // Partial: report contiguous progress for THIS transfer (echo the
+        // request's index, not our own snapshotIndex — a fresh follower's is 0)
+        // so the leader advances the window (or resends from the gap).
+        emitIsr(from, InstallSnapshotReply(storage.currentTerm,
+                rpc.lastIncludedIndex, have, false));
     }
 
     void onInstallSnapshotReply(NodeId from, const ref InstallSnapshotReply rpc) nothrow
@@ -646,15 +784,32 @@ struct RaftNode
             stepDown(rpc.term);
             return;
         }
-        if (role_ != Role.leader || rpc.term != storage.currentTerm || rpc.lastIncludedIndex == 0)
+        if (role_ != Role.leader || rpc.term != storage.currentTerm)
             return;
-        if (rpc.lastIncludedIndex > idxGet(matchIndex, from, 0))
-            matchIndex[from] = rpc.lastIncludedIndex;
-        nextIndex[from] = idxGet(matchIndex, from, 0) + 1;
-        snapshotPending[from] = false; // snapshot delivered; resume normal append
-        advanceCommit();
-        if (idxGet(nextIndex, from, 1) <= storage.lastIndex)
-            sendAppendTo(from);
+        const shipping = idxGet(snapSendIndex, from, 0);
+        // Completed transfer: the follower installed a snapshot at least as new
+        // as the one we're shipping. Advance and resume normal replication.
+        if (rpc.installed && rpc.lastIncludedIndex > 0 && rpc.lastIncludedIndex >= shipping)
+        {
+            if (rpc.lastIncludedIndex > idxGet(matchIndex, from, 0))
+                matchIndex[from] = rpc.lastIncludedIndex;
+            nextIndex[from] = idxGet(matchIndex, from, 0) + 1;
+            snapSendIndex.remove(from);
+            snapAcked.remove(from);
+            snapSent.remove(from);
+            snapAckedAtHb.remove(from);
+            advanceCommit();
+            if (idxGet(nextIndex, from, 1) <= storage.lastIndex)
+                sendAppendTo(from);
+            return;
+        }
+        // Progress for the transfer we're actively shipping: advance the window
+        // base and push more chunks. Ignore a reply for a superseded transfer.
+        if (shipping == 0 || rpc.lastIncludedIndex != shipping)
+            return;
+        if (rpc.bytesStored > ulongGet(snapAcked, from, 0))
+            snapAcked[from] = rpc.bytesStored;
+        sendSnapshotChunks(from);
     }
 
     // Highest index replicated on a majority of `members`: the majority-th
