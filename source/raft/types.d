@@ -128,6 +128,10 @@ struct InstallSnapshot
     ulong offset; // byte offset of THIS chunk within the full snapshot
     ulong totalLen; // full snapshot size (lets the follower preallocate + sanity-check)
     bool done; // true iff this is the final chunk (offset + data.length == totalLen)
+    const(ubyte)[] config; // the cluster configuration as of lastIncludedIndex,
+    // encoded (encodeConfig form). Snapshot-level metadata repeated on every
+    // chunk (it is tiny): a follower whose config entry was compacted into this
+    // snapshot recovers membership from here instead of reverting to bootstrap.
     const(ubyte)[] data; // THIS chunk's bytes (a slice of the state-machine snapshot)
 }
 

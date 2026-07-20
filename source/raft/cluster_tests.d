@@ -270,4 +270,57 @@ version (unittest)
         c.converged().expect.to.equal(true);
         c.appliedCount.expect.to.equal(1);
     }
+
+    // Red-team: a follower must never advance commitIndex — or advertise a
+    // matchIndex — past the entries actually in its log, no matter what an
+    // AppendEntries claims. The attack: prevLogIndex=0 (bypasses the log-match
+    // check) with N filler entries {index:0,term:0} that all match-and-skip
+    // (termAt(0)==0), so NOTHING is appended, plus a huge leaderCommit. Before
+    // the clamp, lastNew = 0 + N drove commitIndex past the real log end, which
+    // makes takeCommitted() jump lastApplied ahead and later SKIP real committed
+    // entries (state-machine divergence) and reply with an unbacked matchIndex.
+    @("raft.append_cannot_advance_commit_past_log")
+    unittest
+    {
+        import raft.node : RaftNode, Config;
+
+        auto s = new MemoryStorage;
+        s.setCurrentTerm(1);
+        LogEntry[3] seed = [
+            LogEntry(1, 1, pay("a")), LogEntry(1, 2, pay("b")), LogEntry(1, 3, pay("c"))
+        ];
+        s.append(seed[]);
+
+        Config cfg;
+        cfg.self = 1;
+        cfg.peers = [2, 3];
+        auto n = RaftNode(cfg, s);
+        s.lastIndex.expect.to.equal(3UL);
+
+        LogEntry[5] filler;
+        foreach (ref e; filler)
+            e = LogEntry(0, 0, null);
+        AppendEntries rpc = {
+            term: 1, leaderId: 2, prevLogIndex: 0, prevLogTerm: 0,
+            leaderCommit: 1000, entries: filler[]
+        };
+        n.onAppendEntries(2, rpc);
+
+        // commit clamped to the real log end (was 5 / 1000 before the fix)
+        n.commitIndex.expect.to.equal(3UL);
+        (n.commitIndex <= s.lastIndex).expect.to.equal(true);
+        s.lastIndex.expect.to.equal(3UL); // nothing spurious appended
+
+        // and the reply's matchIndex is clamped to what the log can back
+        auto rd = n.takeReady();
+        bool sawReply = false;
+        foreach (m; rd.messages)
+            if (m.type == MessageType.appendEntriesReply)
+            {
+                m.aer.matchIndex.expect.to.equal(3UL);
+                m.aer.success.expect.to.equal(true);
+                sawReply = true;
+            }
+        sawReply.expect.to.equal(true);
+    }
 }

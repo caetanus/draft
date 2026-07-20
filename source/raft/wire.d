@@ -182,6 +182,8 @@ const(ubyte)[] encodeInstallSnapshot(NodeId sender, const ref InstallSnapshot m)
         putU64(o, m.offset);
         putU64(o, m.totalLen);
         putU8(o, m.done ? 1 : 0);
+        putU32(o, cast(uint) m.config.length);
+        appendBytes(o, m.config);
         putU32(o, cast(uint) m.data.length);
         appendBytes(o, m.data);
     });
@@ -208,6 +210,10 @@ bool decodeInstallSnapshot(scope const(ubyte)[] body_, out InstallSnapshot m) no
     m.offset = r.u64();
     m.totalLen = r.u64();
     m.done = r.u8() != 0;
+    auto clen = r.u32();
+    if (!r.ok)
+        return false;
+    m.config = r.bytes(clen); // slice into body_ (copied synchronously on install)
     auto len = r.u32();
     if (!r.ok)
         return false;
@@ -416,9 +422,10 @@ version (unittest)
     {
         // a middle chunk (offset > 0, not done) with NUL/high bytes intact
         auto chunk = cast(const(ubyte)[]) "\x00\xffchunk\x01bytes\x00";
+        auto cfg = cast(const(ubyte)[]) "\x01\x00cfg\xff"; // membership metadata
         InstallSnapshot m = {
             term: 12, leaderId: 3, lastIncludedIndex: 900, lastIncludedTerm: 11,
-            offset: 4_194_304, totalLen: 10_000_000, done: false, data: chunk
+            offset: 4_194_304, totalLen: 10_000_000, done: false, config: cfg, data: chunk
         };
         NodeId s;
         auto b = body_(encodeInstallSnapshot(3, m), s);
@@ -431,6 +438,7 @@ version (unittest)
         got.offset.expect.to.equal(4_194_304UL);
         got.totalLen.expect.to.equal(10_000_000UL);
         got.done.expect.to.equal(false);
+        (got.config == cfg).expect.to.equal(true); // membership survives the wire
         (got.data == chunk).expect.to.equal(true);
         // the chunk must be a SLICE into the frame body, not a GC .dup (which
         // leaked per chunk under GC.disable) — assert it aliases the input

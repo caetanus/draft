@@ -71,6 +71,9 @@ struct RaftNode
     // so they must never be spliced into this one
     private ulong snapStagingTotal; // totalLen pinned at offset 0: the staging
     // buffer is bounded to this so a peer can't grow it without limit
+    private ByteVec snapStagingConfig; // membership pinned with this transfer,
+    // installed atomically with the snapshot so a follower whose config entry was
+    // compacted into it recovers membership instead of reverting to bootstrap
     private ulong maxSnapshotBytes; // cap on an accepted snapshot (0 = none)
     private Vec!RaftMessage outbox; // malloc-backed, reused each cycle (zero-GC)
     private Vec!RaftMessage readyMessages; // takeReady snapshot, isolated from later emits
@@ -161,7 +164,9 @@ struct RaftNode
     {
         if (upto == 0 || upto > lastApplied || upto <= storage.snapshotIndex)
             return;
-        storage.saveSnapshot(upto, storage.termAt(upto), snapshotData);
+        // Persist the membership as of `upto` WITH the snapshot, so compacting
+        // away the config entry does not lose it (recovered by refreshConfigFromLog).
+        storage.saveSnapshot(upto, storage.termAt(upto), configAsOf(upto), snapshotData);
     }
 
     /// The lowest matchIndex across the other servers (0 if any follower has
@@ -370,10 +375,26 @@ struct RaftNode
             noteAppended(rpc.entries[k .. $]);
             break;
         }
+        // A follower must never advance commit — or report a matchIndex —
+        // beyond the entries actually in its log. Honest leaders send contiguous
+        // entries so `prevLogIndex + entries.length == storage.lastIndex` here.
+        // A malformed/hostile AppendEntries can violate that: e.g. prevLogIndex=0
+        // (which bypasses the log-match check) carrying N filler entries that all
+        // match-and-skip (index/term already satisfied, so nothing is appended)
+        // plus a large leaderCommit. Unclamped, `lastNew = 0 + N` would drive
+        // commitIndex_ past lastIndex, so takeCommitted() jumps lastApplied ahead
+        // and later SKIPS real committed entries (state-machine divergence); the
+        // reply would also advertise a matchIndex the log can't back. Clamp to
+        // the real log end — a no-op on the honest path.
         auto lastNew = rpc.prevLogIndex + rpc.entries.length;
+        if (lastNew > storage.lastIndex)
+            lastNew = storage.lastIndex;
         if (rpc.leaderCommit > commitIndex_)
-            commitIndex_ = rpc.leaderCommit < lastNew ? rpc.leaderCommit
-                : (lastNew > commitIndex_ ? lastNew : commitIndex_);
+        {
+            const c = rpc.leaderCommit < lastNew ? rpc.leaderCommit : lastNew;
+            if (c > commitIndex_)
+                commitIndex_ = c;
+        }
         emitAer(from, AppendEntriesReply(storage.currentTerm, true, lastNew));
     }
 
@@ -440,8 +461,11 @@ struct RaftNode
 
     private void refreshConfigFromLog() nothrow
     {
+        // Only the retained log (> snapshotIndex) can hold a live config entry;
+        // compacted entries are gone. Scanning to 1 would also be O(snapshotIndex)
+        // wasted lookups per truncation.
         auto last = storage.lastIndex;
-        for (auto i = last; i >= 1; i--)
+        for (auto i = last; i > storage.snapshotIndex; i--)
         {
             auto es = storage.entriesFrom(i, 1);
             if (es.length && isConfigEntry(es[0].payload))
@@ -451,8 +475,40 @@ struct RaftNode
                 return;
             }
         }
-        activeConfig = bootstrapConfig;
-        configEntryIndex = 0;
+        // No live config entry: the membership as of the snapshot survives in the
+        // snapshot metadata (persisted through compaction). Only when there is no
+        // snapshot config either do we fall back to the bootstrap (config-file)
+        // membership. This is what stops compaction / a snapshot install from
+        // silently reverting a committed membership change to bootstrap.
+        auto snapCfg = storage.snapshotConfig();
+        if (snapCfg.length)
+        {
+            activeConfig = decodeConfig(snapCfg);
+            configEntryIndex = 0; // lives in the snapshot, not a live log entry
+        }
+        else
+        {
+            activeConfig = bootstrapConfig;
+            configEntryIndex = 0;
+        }
+    }
+
+    // The cluster configuration as of log index `upto` (encodeConfig form),
+    // for persisting WITH a snapshot that compacts up to `upto`: the latest
+    // config entry in (snapshotIndex, upto], else the config already carried in
+    // the current snapshot, else bootstrap. Returned bytes are consumed
+    // synchronously by saveSnapshot (may alias a to-be-freed entry payload).
+    private const(ubyte)[] configAsOf(Index upto) nothrow
+    {
+        auto hi = upto < storage.lastIndex ? upto : storage.lastIndex;
+        for (auto i = hi; i > storage.snapshotIndex; i--)
+        {
+            auto es = storage.entriesFrom(i, 1);
+            if (es.length && isConfigEntry(es[0].payload))
+                return es[0].payload;
+        }
+        auto sc = storage.snapshotConfig();
+        return sc.length ? sc : encodeConfig(bootstrapConfig);
     }
 
     // --- majorities over the (possibly joint) configuration ---
@@ -676,11 +732,12 @@ struct RaftNode
         const total = data.length;
         const term = storage.currentTerm;
         const sterm = storage.snapshotTerm;
+        auto scfg = storage.snapshotConfig; // membership shipped with every chunk
         // Empty snapshot: one `done` frame carries (index, term); it re-sends at
         // most once per cycle until the follower installs and acks.
         if (total == 0)
         {
-            emitIs(to, InstallSnapshot(term, self, snapIdx, sterm, 0, 0, true, null));
+            emitIs(to, InstallSnapshot(term, self, snapIdx, sterm, 0, 0, true, scfg, null));
             return;
         }
         const chunk = snapshotChunkBytes;
@@ -694,7 +751,7 @@ struct RaftNode
                 end = total;
             const done = end >= total;
             emitIs(to, InstallSnapshot(term, self, snapIdx, sterm, sent, total, done,
-                    data[cast(size_t) sent .. cast(size_t) end]));
+                    scfg, data[cast(size_t) sent .. cast(size_t) end]));
             sent = end;
         }
         snapSent[to] = sent;
@@ -767,6 +824,10 @@ struct RaftNode
             snapStagingTerm = rpc.lastIncludedTerm;
             snapStagingLeaderTerm = rpc.term;
             snapStagingTotal = rpc.totalLen; // pinned: bounds the staging buffer
+            // Pin the membership shipped with this transfer (repeated on every
+            // chunk; captured at offset 0). Installed atomically with the snapshot.
+            snapStagingConfig.clear();
+            appendBytes(snapStagingConfig, rpc.config);
         }
 
         // Well-formedness: every chunk must agree on the total and stay within it.
@@ -793,17 +854,22 @@ struct RaftNode
         // machine, so a torn/aborted snapshot is invisible.
         if (rpc.done && have == snapStagingTotal)
         {
-            storage.saveSnapshot(snapStagingIndex, snapStagingTerm, snapStaging.data);
+            storage.saveSnapshot(snapStagingIndex, snapStagingTerm,
+                    snapStagingConfig.data, snapStaging.data);
             if (persistedIndex_ < snapStagingIndex)
                 persistedIndex_ = snapStagingIndex;
             commitIndex_ = snapStagingIndex;
             lastApplied = snapStagingIndex;
+            // Membership is now in the snapshot (just saved) — refreshConfigFromLog
+            // adopts it (a follower whose config entry was compacted into this
+            // snapshot would otherwise revert to bootstrap).
             refreshConfigFromLog();
             // hand the snapshot to the host to load into the state machine
             pendingSnapshot = new SnapshotToApply(snapStagingIndex, snapStagingTerm,
                     snapStaging.data.dup);
             const installed = snapStagingIndex;
             snapStaging.clear();
+            snapStagingConfig.clear();
             snapStagingIndex = 0;
             snapStagingLeaderTerm = 0;
             snapStagingTotal = 0;
@@ -847,8 +913,19 @@ struct RaftNode
         // base and push more chunks. Ignore a reply for a superseded transfer.
         if (shipping == 0 || rpc.lastIncludedIndex != shipping)
             return;
+        // Clamp the follower-reported progress to what we ACTUALLY sent: it can
+        // never have stored more than we shipped. Without this a bogus bytesStored
+        // could push snapAcked past snapSent, and the next `sent - acked` in
+        // sendSnapshotChunks would underflow (ulong) into a huge value, stalling
+        // the transfer to that follower. snapAcked only ever moves forward.
         if (rpc.bytesStored > ulongGet(snapAcked, from, 0))
-            snapAcked[from] = rpc.bytesStored;
+        {
+            ulong acked = rpc.bytesStored;
+            const sent = ulongGet(snapSent, from, 0);
+            if (acked > sent)
+                acked = sent;
+            snapAcked[from] = acked;
+        }
         sendSnapshotChunks(from);
     }
 
@@ -860,7 +937,13 @@ struct RaftNode
     {
         if (members.length == 0)
             return commitIndex_; // an empty half of a config imposes no bound
-        Index[64] vals = void;
+        // Sized to the same ceiling decodeConfig accepts (MAX_MEMBERS). A smaller
+        // fixed array would silently drop members past it and compute the commit
+        // majority over a subset — advancing commit without a TRUE majority
+        // (safety) for any config larger than the array. decodeConfig already
+        // refuses configs beyond MAX_MEMBERS, so this never truncates a config
+        // the node would accept.
+        Index[MAX_MEMBERS] vals = void;
         size_t n = 0;
         foreach (m; members)
         {

@@ -81,6 +81,45 @@ version (unittest)
         c.appliedCount.expect.to.equal(7);
     }
 
+    @("raft.membership_survives_compaction_and_restart")
+    unittest
+    {
+        // Regression: a committed membership change must NOT be lost when the
+        // config entry is compacted into a snapshot. activeConfig is derived
+        // from the log, so after compaction the snapshot must carry the config;
+        // on restart (fresh volatile state, same storage) the node recovers it
+        // from the snapshot instead of reverting to the bootstrap config.
+        auto c = new Cluster(3, 5);
+        c.electLeader().expect.to.equal(true);
+        foreach (i; 0 .. 6)
+            c.propose(pay("x"));
+        foreach (_; 0 .. 30)
+            c.step();
+
+        // shrink to {1,2}: node 3 leaves — active config now DIFFERS from the
+        // bootstrap {1,2,3}, so a revert-to-bootstrap bug is observable.
+        c.changeMembership([1, 2]).expect.to.equal(true);
+        foreach (_; 0 .. 120)
+            c.step();
+        auto l = c.leader();
+        (l != 0 && l <= 2).expect.to.equal(true);
+        c.nodes[l - 1].members.length.expect.to.equal(2);
+
+        // compact the leader past the config entries (its snapshot now pins {1,2})
+        c.compactLeader();
+        foreach (_; 0 .. 10)
+            c.step();
+
+        // restart it: the ctor re-derives the config. Bootstrap is {1,2,3}; the
+        // fix recovers {1,2} from the snapshot config.
+        c.restart(l);
+        foreach (_; 0 .. 5)
+            c.step();
+        c.nodes[l - 1].members.length.expect.to.equal(2); // NOT reverted to 3
+        c.memberOf(l, 3).expect.to.equal(false); // node 3 stays removed
+        (c.memberOf(l, 1) && c.memberOf(l, 2)).expect.to.equal(true);
+    }
+
     @("raft.remove_node")
     unittest
     {

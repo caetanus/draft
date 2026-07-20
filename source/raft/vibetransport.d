@@ -37,6 +37,19 @@ alias MessageHandler = void delegate(NodeId from, MsgKind kind, scope const(ubyt
 alias CompressFn = size_t function(scope const(ubyte)[] src, ref ByteVec dst) nothrow @system;
 alias DecompressFn = bool function(scope const(ubyte)[] src, size_t origLen, ref ByteVec dst) nothrow @system;
 
+/// Optional wire authentication, injected by the host (keeps this library free
+/// of any crypto dependency). `sign` writes a TAG_LEN-byte MAC of the whole
+/// on-wire frame into `tagOut`; `verify` recomputes and constant-time-compares.
+/// When set, EVERY outbound frame carries a trailing tag and EVERY inbound frame
+/// must verify — a frame that fails (forged / unsigned / wrong secret) drops the
+/// connection. Because there is no per-frame flag, auth must be uniform across
+/// the cluster (a shared secret, set on every node — not a rolling change).
+alias SignFn = void function(scope const(ubyte)[] frame, ubyte[] tagOut) nothrow @system;
+alias VerifyFn = bool function(scope const(ubyte)[] frame, scope const(ubyte)[] tag) nothrow @system;
+// Tag length appended per frame when auth is on (BLAKE2b-128 = 16). Must match
+// the host's MAC output width.
+private enum size_t TAG_LEN = 16;
+
 // Frames below this body size are never compressed: LZ4 has a fixed overhead
 // and tiny frames (heartbeats, votes, replies) neither shrink nor matter to
 // bandwidth. Only sizeable AppendEntries/InstallSnapshot bodies — "the logs" —
@@ -66,6 +79,10 @@ final class VibeTransport
     private ByteVec cbuf; // compress scratch (leader)
     private ByteVec cframe; // framed compressed message (leader)
     private ByteVec dbuf; // decompress scratch (follower)
+    // Optional per-frame authentication (see SignFn). Both null = no auth (zero
+    // overhead on the default path). Set together via setAuth.
+    private SignFn signFn;
+    private VerifyFn verifyFn;
 
     private static final class Peer
     {
@@ -103,6 +120,15 @@ final class VibeTransport
     {
         compressFn = compress;
         decompressFn = decompress;
+    }
+
+    /// Enable per-frame authentication with the host's keyed MAC. Both non-null
+    /// => sign every outbound frame and require+verify every inbound one. Must be
+    /// set identically (same secret) on every node in the cluster.
+    void setAuth(SignFn sign, VerifyFn verify)
+    {
+        signFn = sign;
+        verifyFn = verify;
     }
 
     /// Adds a peer to a running transport (a node joining via membership
@@ -206,6 +232,14 @@ final class VibeTransport
         // MAX_INFLIGHT, optimistic nextIndex), so the outbox can't grow without
         // bound for a slow follower and needs no drop-cap here.
         appendBytes(st.outbox, framed);
+        // Authenticate the exact on-wire frame: append its keyed-MAC tag right
+        // after it. The receiver verifies over the same [u32 len][body] bytes.
+        if (signFn !is null)
+        {
+            ubyte[TAG_LEN] tag = void;
+            signFn(framed, tag[]);
+            appendBytes(st.outbox, tag[]);
+        }
         st.hasData.emit();
     }
 
@@ -292,7 +326,8 @@ final class VibeTransport
                 if (n == 0)
                     break;
                 appendBytes(buf, chunk[0 .. n]);
-                consumeFrames(buf);
+                if (!consumeFrames(buf))
+                    break; // auth failure: the stream can't be trusted — drop it
             }
         }
         catch (Exception)
@@ -305,8 +340,11 @@ final class VibeTransport
         }
     }
 
-    private void consumeFrames(ref ByteVec buf) nothrow
+    // Returns false iff a frame failed authentication (the caller drops the
+    // connection); true otherwise (including a clean partial-frame boundary).
+    private bool consumeFrames(ref ByteVec buf) nothrow
     {
+        immutable tagLen = verifyFn !is null ? TAG_LEN : 0;
         auto s = buf[]; // contiguous slice into the malloc buffer
         const total = s.length;
         size_t pos = 0;
@@ -318,14 +356,23 @@ final class VibeTransport
             immutable uint len = raw & LENGTH_MASK; // flag stripped
             if (len > 64 * 1024 * 1024)
                 break;
-            if (total - pos - 4 < len)
+            // Need the frame AND (when auth is on) its trailing tag before we can
+            // act — verifying a half-received tag would false-reject.
+            if (total - pos - 4 < cast(size_t) len + tagLen)
                 break; // incomplete
+            if (tagLen)
+            {
+                auto frame = s[pos .. pos + 4 + len]; // [u32 len][body] — MAC'd bytes
+                auto tag = s[pos + 4 + len .. pos + 4 + len + tagLen];
+                if (!verifyFn(frame, tag))
+                    return false; // forged / unsigned / wrong-secret: drop the conn
+            }
             auto payload = s[pos + 4 .. pos + 4 + len];
             if (compressed)
                 dispatchCompressed(payload);
             else
                 dispatchFrame(payload);
-            pos += 4 + len;
+            pos += 4 + cast(size_t) len + tagLen;
         }
         if (pos > 0)
         {
@@ -335,6 +382,7 @@ final class VibeTransport
                 memmove(s.ptr, s.ptr + pos, rem);
             buf.length = rem;
         }
+        return true;
     }
 
     // A compressed frame payload is [u32 origLen][lz4 bytes]; decompress into
@@ -347,8 +395,12 @@ final class VibeTransport
             return;
         immutable origLen = payload[0] | (cast(uint) payload[1] << 8)
             | (cast(uint) payload[2] << 16) | (cast(uint) payload[3] << 24);
-        if (origLen == 0 || origLen > 128 * 1024 * 1024)
-            return; // bound the decode buffer against a malformed/huge header
+        // Bound the decode buffer to the same 64 MiB ceiling a PLAINTEXT frame
+        // is capped at (consumeFrames), so a tiny compressed frame can never
+        // decompress to more than an uncompressed one could carry — no extra
+        // amplification lever from enabling compression.
+        if (origLen == 0 || origLen > 64 * 1024 * 1024)
+            return;
         if (!decompressFn(payload[4 .. $], origLen, dbuf))
             return;
         dispatchFrame(dbuf.data);
@@ -520,5 +572,82 @@ version (unittest)
         t.consumeFrames(rx);
         fired.expect.to.equal(true);
         gotFrom.expect.to.equal(9U);
+    }
+
+    // A real (if weak) deterministic keyed MAC for the auth-framing test: a
+    // XOR-fold of the frame into a 16-byte tag. Detects any tamper of frame or
+    // tag; no crypto dependency (the production MAC is dreads' BLAKE2b).
+    private void foldSign(scope const(ubyte)[] frame, ubyte[] tagOut) nothrow @system
+    {
+        foreach (ref t; tagOut[0 .. TAG_LEN])
+            t = 0x5A;
+        foreach (i, b; frame)
+            tagOut[i % TAG_LEN] ^= b;
+    }
+
+    private bool foldVerify(scope const(ubyte)[] frame, scope const(ubyte)[] tag) nothrow @system
+    {
+        if (tag.length != TAG_LEN)
+            return false;
+        ubyte[TAG_LEN] e = void;
+        foldSign(frame, e[]);
+        return e[] == tag;
+    }
+
+    @("vibetransport.authenticated_frame_roundtrips")
+    unittest
+    {
+        auto t = new VibeTransport(1, []);
+        t.setAuth(&foldSign, &foldVerify);
+        NodeId gotFrom;
+        bool fired;
+        t.setHandler((NodeId from, MsgKind kind, scope const(ubyte)[] body_) nothrow{
+            cast(void) kind;
+            cast(void) body_;
+            gotFrom = from;
+            fired = true;
+        });
+
+        // build a plaintext frame and append its tag exactly as enqueue() would
+        auto body_ = redundantBody(6, MsgKind.appendEntries, 60);
+        auto framed = frameOf(body_.data);
+        ByteVec wire;
+        appendBytes(wire, framed.data);
+        ubyte[TAG_LEN] tag = void;
+        foldSign(framed.data, tag[]);
+        appendBytes(wire, tag[]);
+
+        // good frame: verifies and dispatches; the whole frame+tag is consumed
+        t.consumeFrames(wire).expect.to.equal(true);
+        fired.expect.to.equal(true);
+        gotFrom.expect.to.equal(6U);
+    }
+
+    @("vibetransport.forged_frame_drops_connection")
+    unittest
+    {
+        auto t = new VibeTransport(1, []);
+        t.setAuth(&foldSign, &foldVerify);
+        bool fired;
+        t.setHandler((NodeId from, MsgKind kind, scope const(ubyte)[] body_) nothrow{
+            cast(void) from;
+            cast(void) kind;
+            cast(void) body_;
+            fired = true;
+        });
+
+        auto body_ = redundantBody(6, MsgKind.appendEntries, 60);
+        auto framed = frameOf(body_.data);
+        ByteVec wire;
+        appendBytes(wire, framed.data);
+        ubyte[TAG_LEN] tag = void;
+        foldSign(framed.data, tag[]);
+        tag[0] ^= 0x01; // forge: corrupt the tag (or, equivalently, an unsigned peer)
+        appendBytes(wire, tag[]);
+
+        // consumeFrames returns false (caller drops the connection) and NOTHING
+        // is dispatched — a forged / unauthenticated frame never reaches the node.
+        t.consumeFrames(wire).expect.to.equal(false);
+        fired.expect.to.equal(false);
     }
 }

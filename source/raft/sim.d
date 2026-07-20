@@ -19,6 +19,7 @@ final class MemoryStorage : Storage
     private Index snapIdx_; // lastIncludedIndex of the snapshot (0 = none)
     private Term snapTerm_;
     private const(ubyte)[] snapData_;
+    private const(ubyte)[] snapConfig_;
 
 nothrow:
     Term currentTerm()
@@ -93,10 +94,19 @@ nothrow:
         return snapData_;
     }
 
-    void saveSnapshot(Index lastIncludedIndex, Term lastIncludedTerm, scope const(ubyte)[] data)
+    const(ubyte)[] snapshotConfig()
+    {
+        return snapConfig_;
+    }
+
+    void saveSnapshot(Index lastIncludedIndex, Term lastIncludedTerm,
+            scope const(ubyte)[] config, scope const(ubyte)[] data)
     {
         if (lastIncludedIndex <= snapIdx_)
             return;
+        // capture config before dropping the prefix (it may alias a dropped entry)
+        if (config.length)
+            snapConfig_ = config.dup; // else carry the previous one forward
         // keep only entries strictly after the snapshot
         if (lastIncludedIndex >= lastIndex)
             log_ = null;

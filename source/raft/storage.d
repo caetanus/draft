@@ -29,8 +29,16 @@ nothrow:
     Index snapshotIndex(); // lastIncludedIndex of the stored snapshot (0 = none)
     Term snapshotTerm();
     const(ubyte)[] snapshotData();
+    /// The cluster configuration (encodeConfig form) captured with the snapshot,
+    /// i.e. the membership as of lastIncludedIndex. Empty when none was stored.
+    /// This is how membership survives compaction: the config entry that
+    /// established the current membership may have been compacted into the
+    /// snapshot, so it is persisted here rather than lost.
+    const(ubyte)[] snapshotConfig();
     /// Stores a snapshot covering the log up to (index, term) and discards
     /// every entry with index <= that. If the snapshot is ahead of the whole
-    /// log, the log is emptied.
-    void saveSnapshot(Index lastIncludedIndex, Term lastIncludedTerm, scope const(ubyte)[] data);
+    /// log, the log is emptied. `config` is the membership as of that index
+    /// (empty = carry forward the previously stored config).
+    void saveSnapshot(Index lastIncludedIndex, Term lastIncludedTerm,
+            scope const(ubyte)[] config, scope const(ubyte)[] data);
 }

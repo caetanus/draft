@@ -245,18 +245,66 @@ version (unittest)
         b[] = 0xBB; // leader B's snapshot bytes (same index, different layout)
 
         // A (term 5) delivers the first half, then stalls (deposed)
-        feed(1, InstallSnapshot(5, 1, 100, 5, 0, 16, false, a[0 .. 4]));
-        feed(1, InstallSnapshot(5, 1, 100, 5, 4, 16, false, a[4 .. 8]));
+        feed(1, InstallSnapshot(5, 1, 100, 5, 0, 16, false, null, a[0 .. 4]));
+        feed(1, InstallSnapshot(5, 1, 100, 5, 4, 16, false, null, a[4 .. 8]));
         st.snapshotIndex.expect.to.equal(0UL); // nothing installed yet
 
         // B (term 6) ships its whole snapshot from offset 0
-        feed(3, InstallSnapshot(6, 3, 100, 5, 0, 16, false, b[0 .. 4]));
-        feed(3, InstallSnapshot(6, 3, 100, 5, 4, 16, false, b[4 .. 8]));
-        feed(3, InstallSnapshot(6, 3, 100, 5, 8, 16, false, b[8 .. 12]));
-        feed(3, InstallSnapshot(6, 3, 100, 5, 12, 16, true, b[12 .. 16]));
+        feed(3, InstallSnapshot(6, 3, 100, 5, 0, 16, false, null, b[0 .. 4]));
+        feed(3, InstallSnapshot(6, 3, 100, 5, 4, 16, false, null, b[4 .. 8]));
+        feed(3, InstallSnapshot(6, 3, 100, 5, 8, 16, false, null, b[8 .. 12]));
+        feed(3, InstallSnapshot(6, 3, 100, 5, 12, 16, true, null, b[12 .. 16]));
 
         st.snapshotIndex.expect.to.equal(100UL);
         (st.snapshotData == b[]).expect.to.equal(true); // all of B, no A bytes spliced in
+    }
+
+    @("raft.snapshot_install_recovers_membership")
+    unittest
+    {
+        // Regression: a follower whose config entry was compacted into the
+        // leader's snapshot must recover the membership FROM the snapshot (which
+        // now rides the InstallSnapshot wire), not revert to its bootstrap config.
+        import raft.node : RaftNode, Config;
+        import raft.types : InstallSnapshot, encodeConfig, Configuration;
+
+        auto st = new MemoryStorage;
+        Config cfg;
+        cfg.self = 2;
+        cfg.peers = [1, 3]; // bootstrap config = {2,1,3}
+        cfg.snapshotChunkBytes = 8;
+        auto node = new RaftNode(cfg, st);
+        node.members.length.expect.to.equal(3); // bootstrap
+
+        // committed membership as of the snapshot is {1,2} (node 3 removed)
+        Configuration conf;
+        conf.cNew = [1, 2];
+        auto cbytes = encodeConfig(conf).dup; // reused across chunks
+
+        ubyte[16] data;
+        data[] = 0xCD;
+        void feed(NodeId from, InstallSnapshot m)
+        {
+            node.onInstallSnapshot(from, m);
+        }
+
+        feed(1, InstallSnapshot(3, 1, 100, 5, 0, 16, false, cbytes, data[0 .. 8]));
+        feed(1, InstallSnapshot(3, 1, 100, 5, 8, 16, true, cbytes, data[8 .. 16]));
+
+        st.snapshotIndex.expect.to.equal(100UL);
+        // membership recovered from the snapshot config, NOT the bootstrap {1,2,3}
+        node.members.length.expect.to.equal(2);
+        bool has1, has2, has3;
+        foreach (m; node.members)
+        {
+            has1 |= m == 1;
+            has2 |= m == 2;
+            has3 |= m == 3;
+        }
+        (has1 && has2).expect.to.equal(true);
+        has3.expect.to.equal(false); // node 3 is gone, not resurrected by bootstrap
+        // and it is persisted for a later restart to recover from
+        (st.snapshotConfig == cbytes).expect.to.equal(true);
     }
 
     @("raft.snapshot_staging_is_bounded")
@@ -286,15 +334,15 @@ version (unittest)
         evil[] = 0xEE;
 
         // legit start: totalLen=8, first 4 bytes
-        feed(1, InstallSnapshot(5, 1, 100, 5, 0, 8, false, good[0 .. 4]));
+        feed(1, InstallSnapshot(5, 1, 100, 5, 0, 8, false, null, good[0 .. 4]));
         // MALICIOUS #1: a 60-byte chunk at offset 4 (would blow past total=8)
-        feed(1, InstallSnapshot(5, 1, 100, 5, 4, 8, false, evil[0 .. 60]));
+        feed(1, InstallSnapshot(5, 1, 100, 5, 4, 8, false, null, evil[0 .. 60]));
         // MALICIOUS #2: inconsistent, huge declared total mid-transfer
-        feed(1, InstallSnapshot(5, 1, 100, 5, 4, 4_000_000_000, false, evil[0 .. 60]));
+        feed(1, InstallSnapshot(5, 1, 100, 5, 4, 4_000_000_000, false, null, evil[0 .. 60]));
         st.snapshotIndex.expect.to.equal(0UL); // nothing oversized installed
 
         // legit completion: the pinned 8-byte total, exactly
-        feed(1, InstallSnapshot(5, 1, 100, 5, 4, 8, true, good[4 .. 8]));
+        feed(1, InstallSnapshot(5, 1, 100, 5, 4, 8, true, null, good[4 .. 8]));
         st.snapshotIndex.expect.to.equal(100UL);
         st.snapshotData.length.expect.to.equal(8UL); // staging was never grown
         (st.snapshotData == good[0 .. 8]).expect.to.equal(true);
@@ -316,7 +364,7 @@ version (unittest)
         auto node = new RaftNode(cfg, st);
 
         ubyte[16] buf;
-        auto m = InstallSnapshot(5, 1, 100, 5, 0, 1_000_000, false, buf[0 .. 16]);
+        auto m = InstallSnapshot(5, 1, 100, 5, 0, 1_000_000, false, null, buf[0 .. 16]);
         node.onInstallSnapshot(1, m);
         st.snapshotIndex.expect.to.equal(0UL); // refused, nothing staged
     }
